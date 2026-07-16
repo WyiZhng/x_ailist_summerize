@@ -898,9 +898,13 @@ class DigestTaskRunner:
             else:
                 x_provider = self._resolve_x_provider()
                 await progress("authenticating", 5, "Checking X provider")
+                page_provider = callable(getattr(x_provider, "fetch_page", None))
+                requires_page_login = bool(
+                    getattr(x_provider, "requires_login_for_fetch_page", False)
+                )
                 login = (
                     None
-                    if callable(getattr(x_provider, "fetch_page", None))
+                    if page_provider and not requires_page_login
                     else getattr(x_provider, "login", None)
                 )
                 if callable(login):

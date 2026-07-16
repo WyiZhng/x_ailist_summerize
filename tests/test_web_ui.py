@@ -179,6 +179,21 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("白天模式", page)
         self.assertIn("夜间模式", page)
 
+    def test_run_analysis_header_remains_responsive_and_bound(self):
+        status, _, raw = self.request("/")
+        page = raw.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        self.assertIn("@media (max-width: 768px)", page)
+        self.assertIn("@media (max-width: 480px)", page)
+        self.assertRegex(page, r"\.main-nav\s*\{[^}]*flex-wrap:\s*wrap")
+        self.assertRegex(page, r"\.status-container\s*\{[^}]*flex-wrap:\s*wrap")
+        self.assertRegex(page, r"#run-btn\s*\{[^}]*flex:\s*0 0 auto")
+        self.assertIn(".feature-grid { grid-template-columns: 1fr !important; }", page)
+        self.assertIn('class="feature-grid"', page)
+        self.assertIn('id="run-btn" onclick="startAnalysis()"', page)
+        self.assertIn("Run Analysis", page)
+
     def test_non_local_host_is_rejected_for_control_api(self):
         request = urllib.request.Request(
             self.base_url + "/api/config",
@@ -382,12 +397,12 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         history = json.loads((web_ui.OUTPUT_DIR / "history.json").read_text(encoding="utf-8"))
         self.assertIn(report_name, history)
 
-    async def test_incremental_no_new_posts_preserves_previous_report(self):
+    async def test_twikit_incremental_no_new_posts_preserves_previous_report(self):
         config = load_config(web_ui.CONFIG_PATH)
         config["twitter"].update(
             {
                 "list_urls": ["mock://mixed"],
-                "fetch_method": "api",
+                "fetch_method": "twikit",
                 "incremental_sync": True,
             }
         )

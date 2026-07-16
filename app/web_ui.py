@@ -49,7 +49,11 @@ def _build_fetcher(config, list_owner=None):
     method = tw.get('fetch_method', 'twikit')
     if method == 'api':
         return XApiFetcher(bearer_token=tw.get('api_bearer_token', ''), list_owner=list_owner)
-    return XListFetcher(cookies_path=COOKIES_PATH, list_owner=list_owner)
+    return XListFetcher(
+        cookies_path=COOKIES_PATH,
+        list_owner=list_owner,
+        proxy=tw.get('proxy') or None,
+    )
 
 
 def _find_resumable_report_run(store):
@@ -643,8 +647,9 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
             list_urls = twitter_config.get('list_urls', [])
             incremental = bool(
-                twitter_config.get('fetch_method') == 'api'
+                twitter_config.get('fetch_method') in {'twikit', 'browser_session', 'api'}
                 and twitter_config.get('incremental_sync', True)
+                and callable(getattr(fetcher, 'fetch_page', None))
             )
             configured_data_dir = Path(
                 config.get('storage', {}).get('data_dir', 'data')
@@ -803,7 +808,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         /* Header Precision Alignment */
         header {
             display: flex; align-items: center; justify-content: center;
-            padding: 0 40px; height: 90px;
+            padding: 10px 40px; min-height: 90px; height: auto;
             background: var(--header); border-bottom: 1px solid var(--border);
             position: sticky; top: 0; z-index: 100;
         }
@@ -815,6 +820,8 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             max-width: 1400px;
             gap: 20px;
             white-space: nowrap;
+            flex-wrap: wrap;
+            min-width: 0;
         }
         .logo-area { display: flex; align-items: center; gap: 14px; cursor: pointer; flex-shrink: 0; }
         .logo-box { 
@@ -826,15 +833,17 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
         .middle-section {
             display: flex; align-items: center; gap: 15px;
+            flex: 1 1 420px; min-width: 0;
         }
         .status-container {
             background: var(--surface-strong);
             border: 1px solid var(--border);
             border-radius: 50px;
             padding: 5px 5px 5px 24px;
-            display: flex; align-items: center; min-width: 320px;
+            display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+            min-width: 0; width: 100%;
         }
-        .status-label { font-size: 13px; font-weight: 700; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+        .status-label { font-size: 13px; font-weight: 700; color: var(--text-dim); white-space: normal; overflow-wrap: anywhere; flex: 1 1 120px; min-width: 0; }
         .inline-p-con { width: 100px; height: 4px; background: var(--border); border-radius: 10px; margin: 0 20px; display: none; overflow: hidden; }
         .inline-p-bar { height: 100%; width: 0%; background: var(--accent); border-radius: 10px; transition: 0.4s; }
 
@@ -846,6 +855,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             font-size: 14px; margin-left: auto;
         }
         .run-btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
+        #run-btn { flex: 0 0 auto; }
         
         .status-pill { 
             display: flex; align-items: center; gap: 10px; font-size: 12px; font-weight: 700; 
@@ -857,7 +867,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         .dot.active { background: var(--green); box-shadow: 0 0 10px var(--green); }
         .dot.error { background: var(--red); box-shadow: 0 0 10px var(--red); }
 
-        .nav-links { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+        .nav-links { display: flex; align-items: center; gap: 10px; flex: 0 1 auto; flex-wrap: wrap; min-width: 0; }
         .nav-link { 
             color: var(--text-dim); text-decoration: none; font-weight: 700; font-size: 14px; 
             cursor: pointer; transition: 0.2s;
@@ -873,6 +883,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             background: #1d9bf025;
             border: 1px solid #1d9bf040;
         }
+        .feature-grid { min-width: 0; }
 
         /* Settings Grid Layout */
         .container { max-width: 1200px; margin: 40px auto; padding: 0 40px; }
@@ -1077,6 +1088,29 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             background: var(--card) !important;
         }
 
+        @media (max-width: 768px) {
+            header { padding: 10px 16px; }
+            .main-nav { gap: 12px; }
+            .logo-box { width: 52px; height: 52px; border-radius: 13px; }
+            .nav-links { flex: 1 1 auto; justify-content: flex-end; gap: 4px; }
+            .nav-link { padding: 9px 10px; font-size: 13px; }
+            .middle-section { order: 3; flex: 1 1 100%; width: 100%; }
+            .status-container { width: 100%; justify-content: flex-start; padding-left: 16px; }
+            .container { margin-top: 24px; padding: 0 16px; }
+            .settings-grid { grid-template-columns: 1fr; gap: 20px; }
+            .feature-grid { grid-template-columns: 1fr !important; }
+        }
+
+        @media (max-width: 480px) {
+            .nav-links { justify-content: flex-start; flex-basis: 100%; }
+            .middle-section { align-items: stretch; }
+            .status-container { border-radius: 20px; padding: 8px; }
+            .status-label { flex-basis: 100%; padding: 4px 8px; }
+            .inline-p-con { flex: 1 1 100%; margin: 4px 8px; }
+            #run-btn { width: 100%; margin-left: 0; justify-content: center; }
+            .theme-toggle { right: 12px; bottom: 12px; }
+        }
+
     </style>
 </head>
 <body>
@@ -1117,7 +1151,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             <h1 style="font-size: 52px; font-weight: 800; margin-bottom: 25px;">X List Summarizer <span style="font-size: 18px; opacity: 0.6; font-weight: 600; margin-left: 10px;">v1.7.0</span></h1>
             <p style="font-size: 18px; color: var(--text-dim); line-height: 1.6; max-width: 650px; margin: 0 auto;">Turn the noise of X into actionable intelligence. This premium tool analyzes curated lists to extract high-signal trends and media.</p>
         </div>
-        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px;">
+        <div class="feature-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px;">
             <div class="card" style="padding: 35px; border-radius: 28px;">
                 <span style="font-size: 36px; display: block; margin-bottom: 20px;">🔍</span>
                 <div style="font-weight: 800; font-size: 19px; margin-bottom: 12px;">Deep Extraction</div>

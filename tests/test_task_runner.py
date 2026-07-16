@@ -641,6 +641,37 @@ class DigestTaskRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("page" in event.message for event in ingestion_events))
         self.assertTrue(any("new" in event.message for event in ingestion_events))
 
+    async def test_incremental_cookie_page_provider_runs_session_preflight(self) -> None:
+        class CookiePageProvider(MockXIngestionProvider):
+            requires_login_for_fetch_page = True
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.login_calls = 0
+
+            async def login(self):
+                self.login_calls += 1
+                return True, "TEST cookie session ready"
+
+        provider = CookiePageProvider()
+        runner = DigestTaskRunner(
+            x_provider=provider,
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=InMemoryPostStore(),
+        )
+
+        result = await runner.run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(1, provider.login_calls)
+
     async def test_no_new_posts_skips_llm_report_and_history(self) -> None:
         store = InMemoryPostStore()
         first = DigestTaskRunner(

@@ -6,7 +6,9 @@ import sys
 import logging
 import threading
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from collections import defaultdict
 from twikit import Client
@@ -24,7 +26,8 @@ try:
         sanitize_external_url,
         sanitize_image_src,
     )
-    from .x_api_provider import OfficialXApiProvider
+    from .models import XAuthor, XPost, XPostMetrics, XPostReference
+    from .x_api_provider import OfficialXApiProvider, XFetchPage
 except ImportError:  # Compatibility with `python app/web_ui.py`.
     from security import (
         escape_html_text,
@@ -35,18 +38,54 @@ except ImportError:  # Compatibility with `python app/web_ui.py`.
         sanitize_external_url,
         sanitize_image_src,
     )
-    from x_api_provider import OfficialXApiProvider
+    from models import XAuthor, XPost, XPostMetrics, XPostReference
+    from x_api_provider import OfficialXApiProvider, XFetchPage
 
 
 logger = logging.getLogger(__name__)
 
+
+class SessionVerificationState(str, Enum):
+    """Result of the optional account-level Twikit session preflight."""
+
+    VALID = "valid"
+    INVALID = "invalid"
+    INCONCLUSIVE = "inconclusive"
+
+
+@dataclass(frozen=True)
+class SessionVerificationResult:
+    """Classified preflight result while preserving the legacy tuple API."""
+
+    state: SessionVerificationState
+    can_fetch_timeline: bool
+    retryable: bool
+    message: str
+    reason: str
+
 class XListFetcher:
     """Class to fetch and process tweets from X lists with premium reporting."""
+
+    # Incremental ingestion normally assumes a page provider is already
+    # authenticated.  Twikit still needs its cookie preflight before paging.
+    requires_login_for_fetch_page = True
     
-    def __init__(self, cookies_path='browser_session/cookies.json', list_owner=None):
-        self.client = Client('en-US')
+    def __init__(
+        self,
+        cookies_path='browser_session/cookies.json',
+        list_owner=None,
+        proxy=None,
+    ):
+        # Some httpx/twikit versions treat an explicit proxy=None as disabling
+        # proxy discovery, so only pass the keyword when a proxy is configured.
+        self.client = Client('en-US', proxy=proxy) if proxy else Client('en-US')
         self.cookies_path = Path(cookies_path)
         self.list_owner_pref = list_owner
+        self.proxy = proxy
+        self.session_verification_state = SessionVerificationState.INCONCLUSIVE
+        self._session_ready = False
+        self.last_timeline_request_count = 0
+        self.last_pagination_count = 0
         self.list_info = {
             'name': 'X List Summary', 'list_names': [],
             'owner': list_owner or 'Unknown', 
@@ -69,6 +108,109 @@ class XListFetcher:
             # Error reporting must never hide the original failure.
             pass
         return redact_sensitive_text(str(error), secrets=secrets)
+
+    @staticmethod
+    def _is_cloudflare_forbidden(message: str) -> bool:
+        """Return whether a 403 body is recognizably a Cloudflare edge block."""
+        lowered = message.lower()
+        if "403" not in lowered and "forbidden" not in lowered:
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "cloudflare",
+                "attention required",
+                "sorry, you have been blocked",
+                "cf-ray",
+                "cf-wrapper",
+            )
+        )
+
+    def _classify_session_error(self, error) -> SessionVerificationResult:
+        """Classify preflight errors without treating every 403 as harmless."""
+        safe_error = self._safe_error(error)
+        lowered = safe_error.lower()
+
+        if any(
+            marker in lowered
+            for marker in (
+                "401",
+                "unauthorized",
+                "invalid cookie",
+                "could not authenticate",
+                "authentication required",
+            )
+        ):
+            return SessionVerificationResult(
+                SessionVerificationState.INVALID,
+                False,
+                False,
+                "Session expired or unauthorized (401). Please re-import your cookies.",
+                "unauthorized",
+            )
+        if "429" in lowered or "rate limit" in lowered or "recursion" in lowered:
+            return SessionVerificationResult(
+                SessionVerificationState.INCONCLUSIVE,
+                False,
+                False,
+                "Rate limited (429) during session verification. Wait before retrying.",
+                "rate_limited",
+            )
+        if self._is_cloudflare_forbidden(safe_error):
+            return SessionVerificationResult(
+                SessionVerificationState.INCONCLUSIVE,
+                True,
+                False,
+                "Session verification was blocked by Cloudflare (403); continuing with the List timeline request.",
+                "cloudflare_403",
+            )
+        if "403" in lowered or "forbidden" in lowered:
+            return SessionVerificationResult(
+                SessionVerificationState.INVALID,
+                False,
+                False,
+                "Session verification was forbidden (403). Timeline access was not attempted.",
+                "forbidden",
+            )
+        if "404" in lowered:
+            return SessionVerificationResult(
+                SessionVerificationState.INCONCLUSIVE,
+                True,
+                False,
+                "Session verification endpoint returned 404; continuing with the List timeline request.",
+                "verification_not_found",
+            )
+        return SessionVerificationResult(
+            SessionVerificationState.INCONCLUSIVE,
+            False,
+            True,
+            f"Session verification failed: {safe_error[:120]}",
+            "transient_error",
+        )
+
+    def _record_session_verification(self, result: SessionVerificationResult) -> None:
+        self.session_verification_state = result.state
+        self._session_ready = result.can_fetch_timeline
+        logger.info(
+            "session_verification=%s reason=%s",
+            result.state.value,
+            result.reason,
+        )
+
+    async def _verify_loaded_session(self) -> SessionVerificationResult:
+        try:
+            user = await self.client.user()
+            screen_name = getattr(user, "screen_name", "unknown")
+            return SessionVerificationResult(
+                SessionVerificationState.VALID,
+                True,
+                False,
+                f"Logged in as @{screen_name}",
+                "verified",
+            )
+        except Exception as error:
+            logger.warning("Twikit login verification failed (%s)", type(error).__name__)
+            return self._classify_session_error(error)
 
     def _load_user_cache(self):
         """Load username -> User ID mapping from local cache."""
@@ -108,58 +250,266 @@ class XListFetcher:
     async def login(self):
         """Load cookies and verify login."""
         if not self.cookies_path.exists():
-            return False, "Cookies file not found. Please login via settings."
-        
+            result = SessionVerificationResult(
+                SessionVerificationState.INVALID,
+                False,
+                False,
+                "Cookies file not found. Please login via settings.",
+                "cookies_missing",
+            )
+            self._record_session_verification(result)
+            return False, result.message
+
         try:
             self.client.load_cookies(str(self.cookies_path))
-            user = await self.client.user()
-            return True, f"Logged in as @{user.screen_name}"
-        except Exception as e:
-            logger.warning("Twikit login verification failed (%s)", type(e).__name__)
-            err = self._safe_error(e)
-            # 401 = definitively expired/invalid — hard fail
-            if '401' in err:
-                return False, f"Session expired (401). Please re-import your cookies."
-            # 429 = rate limited during the session check itself — hard fail
-            if '429' in err or 'rate limit' in err.lower():
-                return False, f"Rate limited (429) during session check."
-            # twikit's handler recurses on 429 until stack overflow — treat as rate limit
-            if 'recursion' in err.lower():
-                return False, f"X rate-limited your session (twikit recursion trap). Wait ~15 min and retry, or switch Fetch Method to Official X API."
-            # 404 = X's verify endpoint is temporarily unavailable (known X flakiness).
-            # Cookies are still loaded; proceed optimistically and let the tweet
-            # fetch surface a real auth error if the session is actually invalid.
-            if '404' in err:
-                print(f"⚠️ [Login] 404 from X session check (transient flakiness) — proceeding with loaded cookies.")
-                return True, "Session loaded (X returned 404 verifying user, proceeding anyway)"
-            # Any other unexpected error — hard fail with detail
-            return False, f"Login failed: {err}"
+        except Exception as error:
+            result = SessionVerificationResult(
+                SessionVerificationState.INVALID,
+                False,
+                False,
+                f"Cookies could not be loaded: {self._safe_error(error)[:120]}",
+                "cookies_unreadable",
+            )
+            self._record_session_verification(result)
+            return False, result.message
+
+        result = await self._verify_loaded_session()
+        self._record_session_verification(result)
+        return result.can_fetch_timeline, result.message
 
     async def verify_session(self, retries=1):
         """Lightweight check to see if current session is still valid with retry for transient errors."""
-        if not self.cookies_path.exists(): return False, "No cookies"
-        
-        last_err = ""
+        if not self.cookies_path.exists():
+            result = SessionVerificationResult(
+                SessionVerificationState.INVALID,
+                False,
+                False,
+                "No cookies",
+                "cookies_missing",
+            )
+            self._record_session_verification(result)
+            return False, result.message
+
+        try:
+            self.client.load_cookies(str(self.cookies_path))
+        except Exception as error:
+            result = SessionVerificationResult(
+                SessionVerificationState.INVALID,
+                False,
+                False,
+                f"Cookies could not be loaded: {self._safe_error(error)[:120]}",
+                "cookies_unreadable",
+            )
+            self._record_session_verification(result)
+            return False, result.message
+
+        last_result = None
         for attempt in range(retries + 1):
-            try:
-                self.client.load_cookies(str(self.cookies_path))
-                # Just fetch own user info
-                user = await self.client.user()
-                return True, f"OK (@{user.screen_name})"
-            except Exception as e:
-                last_err = self._safe_error(e)
-                # If it's a 401, don't retry, it's definitive
-                if '401' in last_err: break
-                # If it's a rate limit or 404, wait a tiny bit and retry
-                if attempt < retries:
-                    await asyncio.sleep(1)
+            last_result = await self._verify_loaded_session()
+            self._record_session_verification(last_result)
+            if last_result.can_fetch_timeline or not last_result.retryable:
+                return last_result.can_fetch_timeline, last_result.message
+            if attempt < retries:
+                await asyncio.sleep(1)
+
+        return False, last_result.message if last_result else "Session verification failed"
+
+    @staticmethod
+    def _twikit_entities(tweet) -> list[object]:
+        """Return the source tweet and referenced tweets used for normalization."""
+        candidates = [
+            tweet,
+            getattr(tweet, "retweeted_tweet", None),
+            getattr(tweet, "quote", None),
+            getattr(tweet, "quoted_tweet", None),
+        ]
+        return [
+            item
+            for index, item in enumerate(candidates)
+            if item is not None and item not in candidates[:index]
+        ]
+
+    def _twikit_post(self, tweet, list_id: str) -> XPost:
+        """Normalize one Twikit object into the canonical incremental model."""
+        url_map: dict[str, str] = {}
+        urls: list[str] = []
+        media: list[dict] = []
+        seen_media_ids: set[str] = set()
+
+        for source in self._twikit_entities(tweet):
+            legacy = getattr(source, "_legacy", {}) or {}
+            entities = legacy.get("entities", {}) or getattr(source, "entities", {}) or {}
+            if isinstance(entities, dict):
+                for item in entities.get("urls", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    short = item.get("url")
+                    expanded = item.get("expanded_url") or short
+                    if short and expanded:
+                        url_map[str(short)] = str(expanded)
+                    if expanded and not any(
+                        domain in str(expanded).lower()
+                        for domain in ("x.com", "twitter.com", "twimg.com", "t.co")
+                    ):
+                        urls.append(str(expanded))
+
+            extended = legacy.get("extended_entities", {}) or entities
+            if not isinstance(extended, dict):
+                continue
+            for item in extended.get("media", []) or []:
+                if not isinstance(item, dict):
                     continue
-        
-        err = last_err
-        if '401' in err: return False, "Expired/Unauthorized (401)"
-        if 'rate limit' in err.lower() or '429' in err: return False, "Rate Limited by X"
-        if '404' in err: return False, "X Service Busy (404)"
-        return False, f"Invalid: {err[:30]}"
+                media_id = str(item.get("id_str") or item.get("media_key") or "")
+                if media_id and media_id in seen_media_ids:
+                    continue
+                media_type = str(item.get("type") or "")
+                image_url = item.get("media_url_https") or item.get("media_url")
+                normalized: dict[str, object] | None = None
+                if media_type == "photo" and image_url:
+                    normalized = {"type": "photo", "url": image_url, "id": media_id}
+                elif media_type in {"video", "animated_gif"}:
+                    variants = item.get("video_info", {}).get("variants", []) or []
+                    mp4_variants = [
+                        value for value in variants
+                        if isinstance(value, dict) and value.get("content_type") == "video/mp4"
+                    ]
+                    best = max(mp4_variants, key=lambda value: value.get("bitrate", 0), default=None)
+                    if best and best.get("url"):
+                        normalized = {
+                            "type": media_type,
+                            "url": best["url"],
+                            "thumbnail": image_url,
+                            "id": media_id,
+                        }
+                if normalized is not None:
+                    media.append(normalized)
+                    if media_id:
+                        seen_media_ids.add(media_id)
+
+        text = str(getattr(tweet, "text", "") or "")
+        for short, expanded in url_map.items():
+            text = text.replace(short, expanded)
+
+        user = getattr(tweet, "user", None)
+        username = str(getattr(user, "screen_name", "") or "unknown")
+        author_id = str(
+            getattr(user, "id", None)
+            or getattr(user, "rest_id", None)
+            or username
+        )
+        author = XAuthor(
+            id=author_id,
+            username=username,
+            name=getattr(user, "name", None),
+            profile_image_url=getattr(user, "profile_image_url", None),
+        )
+        legacy = getattr(tweet, "_legacy", {}) or {}
+        references: list[XPostReference] = []
+        for relation_type, attribute_names in (
+            ("retweeted", ("retweeted_tweet",)),
+            ("quoted", ("quote", "quoted_tweet")),
+        ):
+            referenced = next(
+                (
+                    getattr(tweet, name, None)
+                    for name in attribute_names
+                    if getattr(tweet, name, None) is not None
+                ),
+                None,
+            )
+            referenced_id = getattr(referenced, "id", None)
+            if referenced_id:
+                references.append(XPostReference(relation_type, str(referenced_id)))
+        reply_id = legacy.get("in_reply_to_status_id_str") or legacy.get("in_reply_to_status_id")
+        if reply_id:
+            references.append(XPostReference("replied_to", str(reply_id)))
+
+        return XPost(
+            id=str(getattr(tweet, "id", "") or ""),
+            text=text,
+            author_id=author_id,
+            author=author,
+            created_at=getattr(tweet, "created_at", None),
+            language=legacy.get("lang"),
+            conversation_id=(
+                getattr(tweet, "conversation_id", None)
+                or legacy.get("conversation_id_str")
+            ),
+            source_list_id=list_id,
+            metrics=XPostMetrics(
+                likes=getattr(tweet, "favorite_count", 0),
+                retweets=getattr(tweet, "retweet_count", 0),
+                replies=getattr(tweet, "reply_count", 0),
+                quotes=getattr(tweet, "quote_count", 0),
+                bookmarks=getattr(tweet, "bookmark_count", 0),
+                impressions=getattr(tweet, "view_count", None),
+            ),
+            references=references,
+            urls=list(dict.fromkeys(urls)),
+            media=media,
+            raw_payload={"provider": "twikit"},
+        )
+
+    async def fetch_page(
+        self,
+        list_id: str,
+        *,
+        pagination_token: str | None = None,
+        max_results: int = 100,
+        page_number: int = 1,
+        run_id: str | None = None,
+    ) -> XFetchPage:
+        """Fetch one cookie-authenticated Twikit page for incremental ingestion."""
+        if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
+            raise ValueError("max_results must be a positive integer")
+        if not self._session_ready:
+            success, message = await self.login()
+            if not success:
+                raise RuntimeError(message)
+
+        normalized_list_id = self.extract_list_id(list_id)
+        if page_number <= 1:
+            self.last_timeline_request_count = 0
+            self.last_pagination_count = 0
+        self.last_timeline_request_count += 1
+        self.last_pagination_count = max(0, self.last_timeline_request_count - 1)
+        try:
+            batch = await self.client.get_list_tweets(
+                normalized_list_id,
+                count=min(40, max_results),
+                cursor=pagination_token,
+            )
+            posts = [
+                self._twikit_post(tweet, normalized_list_id)
+                for tweet in list(batch or [])[:max_results]
+            ]
+            next_token = getattr(batch, "next_cursor", None) if batch else None
+            logger.info(
+                "timeline_fetch=success list_id=%s returned_count=%s request_count=%s pagination_count=%s",
+                normalized_list_id,
+                len(posts),
+                self.last_timeline_request_count,
+                self.last_pagination_count,
+            )
+            return XFetchPage(
+                list_id=normalized_list_id,
+                posts=posts,
+                next_token=str(next_token) if next_token else None,
+                page_number=page_number,
+            )
+        except Exception as error:
+            safe_error = self._safe_error(error)
+            lowered = safe_error.lower()
+            if "429" in lowered or "rate limit" in lowered:
+                logger.warning("timeline_fetch=rate_limited list_id=%s", normalized_list_id)
+                raise RuntimeError("X timeline rate limited (429). Wait before retrying.") from error
+            if "401" in lowered or "unauthorized" in lowered:
+                logger.warning("timeline_fetch=unauthorized list_id=%s", normalized_list_id)
+                raise RuntimeError("X session unauthorized (401). Re-import your cookies.") from error
+            if "403" in lowered or "forbidden" in lowered:
+                logger.warning("timeline_fetch=forbidden list_id=%s", normalized_list_id)
+                raise RuntimeError("X timeline access forbidden (403).") from error
+            raise RuntimeError(f"X timeline fetch failed: {safe_error[:120]}") from error
 
     async def get_user_memberships(self, username: str):
         """Fetch all lists that a specific user is a member of (Profiler feature)."""
@@ -234,11 +584,19 @@ class XListFetcher:
 
     async def fetch_list_tweets(self, list_url_or_id: str, max_tweets: int = 100, delay: float = 0):
         """Fetch tweets from a list (Aggregates metadata)."""
+        if isinstance(max_tweets, bool) or not isinstance(max_tweets, int):
+            raise ValueError("max_tweets must be an integer")
+        self.last_timeline_request_count = 0
+        self.last_pagination_count = 0
+        if max_tweets <= 0:
+            logger.info("timeline_fetch=success returned_count=0 reason=non_positive_limit")
+            return []
+
         if delay > 0:
             await asyncio.sleep(delay)
             
         list_id = self.extract_list_id(list_url_or_id)
-        print(f"📋 Fetching list {list_id}...")
+        logger.info("timeline_fetch=starting list_id=%s", list_id)
         
         tweets = []
         cursor = None
@@ -255,18 +613,36 @@ class XListFetcher:
                 list_name = getattr(l_info, 'name', None)
                 member_count_for_list = getattr(l_info, 'member_count', 0)
                 owner_obj = getattr(l_info, 'user', getattr(l_info, 'creator', None))
-                print(f"✅ List info via twikit: '{list_name}', {member_count_for_list} members")
+                logger.info(
+                    "list_metadata=success provider=twikit list_id=%s list_name=%s member_count=%s",
+                    list_id,
+                    list_name,
+                    member_count_for_list,
+                )
             except Exception as _e:
-                print(f"⚠️ get_list() failed for {list_id}: {self._safe_error(_e)} — trying v1.1 fallback")
+                logger.warning(
+                    "list_metadata=failed provider=twikit list_id=%s error=%s fallback=v1.1",
+                    list_id,
+                    self._safe_error(_e),
+                )
                 try:
                     v1_url = f'https://api.twitter.com/1.1/lists/show.json?list_id={list_id}'
                     v1_resp, _ = await self.client.get(v1_url, headers=self.client._base_headers)
                     if v1_resp:
                         list_name = v1_resp.get('name')
                         member_count_for_list = v1_resp.get('member_count', 0)
-                        print(f"✅ List info via v1.1: '{list_name}', {member_count_for_list} members")
+                        logger.info(
+                            "list_metadata=success provider=v1.1 list_id=%s list_name=%s member_count=%s",
+                            list_id,
+                            list_name,
+                            member_count_for_list,
+                        )
                 except Exception as _e2:
-                    print(f"⚠️ v1.1 list info also failed for {list_id}: {self._safe_error(_e2)}")
+                    logger.warning(
+                        "list_metadata=failed provider=v1.1 list_id=%s error=%s",
+                        list_id,
+                        self._safe_error(_e2),
+                    )
 
             if list_name:
                 self.list_info['list_names'].append(list_name)
@@ -291,10 +667,21 @@ class XListFetcher:
 
             # 2. Fetch Tweets
             while len(tweets) < max_tweets:
-                batch = await self.client.get_list_tweets(list_id, count=min(40, max_tweets - len(tweets)), cursor=cursor)
+                remaining = max_tweets - len(tweets)
+                if remaining <= 0:
+                    break
+                self.last_timeline_request_count += 1
+                self.last_pagination_count = max(0, self.last_timeline_request_count - 1)
+                batch = await self.client.get_list_tweets(
+                    list_id,
+                    count=min(40, remaining),
+                    cursor=cursor,
+                )
                 if not batch: break
                 
                 for tweet in batch:
+                    if len(tweets) >= max_tweets:
+                        break
                     # Resolve Links & Entities — including retweets and quote tweets
                     resolved_links = set()
                     url_map = {}
@@ -396,21 +783,37 @@ class XListFetcher:
                         'quotes': getattr(tweet, 'quote_count', 0),
                         'bookmarks': getattr(tweet, 'bookmark_count', 0)
                     })
-                
+
+                if len(tweets) >= max_tweets:
+                    break
                 cursor = batch.next_cursor
                 if not cursor: break
-            
-            return tweets
+
+            logger.info(
+                "timeline_fetch=success list_id=%s returned_count=%s request_count=%s pagination_count=%s",
+                list_id,
+                len(tweets),
+                self.last_timeline_request_count,
+                self.last_pagination_count,
+            )
+            return tweets[:max_tweets]
         except Exception as e:
             err = self._safe_error(e)
             # Re-raise rate limit and auth errors so the caller can show a clear message
             if '429' in err or 'rate limit' in err.lower():
+                logger.warning("timeline_fetch=rate_limited list_id=%s", list_id)
                 raise Exception(f"X Rate Limit reached fetching list {list_id}. Please wait 15 minutes and try again.") from e
             if '401' in err or 'unauthorized' in err.lower():
+                logger.warning("timeline_fetch=unauthorized list_id=%s", list_id)
                 raise Exception(f"X session unauthorized (401) fetching list {list_id}. Please re-import your cookies via Settings → X Account.") from e
+            if '403' in err or 'forbidden' in err.lower():
+                logger.warning("timeline_fetch=forbidden list_id=%s", list_id)
+                raise Exception(
+                    f"X timeline access forbidden (403) fetching list {list_id}."
+                ) from e
             # Preserve already-fetched pages, but surface complete list failures
             # so the task runner can report partial success accurately.
-            print(f"❌ Error fetching list {list_id}: {err}")
+            logger.error("timeline_fetch=failed list_id=%s error=%s", list_id, err)
             if tweets:
                 return tweets
             raise RuntimeError(f"X list {list_id} fetch failed: {err}") from e
