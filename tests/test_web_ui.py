@@ -167,6 +167,18 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("allow-same-origin", report_csp)
 
+    def test_root_includes_persistent_light_theme_toggle(self):
+        status, _, raw = self.request("/")
+        page = raw.decode("utf-8")
+
+        self.assertEqual(status, 200)
+        self.assertIn(':root[data-theme="light"]', page)
+        self.assertIn('id="theme-toggle"', page)
+        self.assertIn("function toggleTheme()", page)
+        self.assertIn("localStorage.setItem(THEME_STORAGE_KEY, nextTheme)", page)
+        self.assertIn("白天模式", page)
+        self.assertIn("夜间模式", page)
+
     def test_non_local_host_is_rejected_for_control_api(self):
         request = urllib.request.Request(
             self.base_url + "/api/config",

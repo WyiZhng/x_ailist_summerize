@@ -732,6 +732,18 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>X List Summarizer v1.7</title>
+    <script>
+        (() => {
+            try {
+                const savedTheme = localStorage.getItem('xls-theme');
+                if (savedTheme === 'light' || savedTheme === 'dark') {
+                    document.documentElement.dataset.theme = savedTheme;
+                }
+            } catch (_) {
+                // Storage can be unavailable in privacy-restricted browsers.
+            }
+        })();
+    </script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -746,6 +758,40 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             --green: #00ba7c;
             --red: #f4212e;
             --blue-tip: #1d9bf01a;
+            --surface-strong: #000;
+            --surface-input: #080a0f;
+            --surface-elevated: #151921;
+            --surface-action: #1e232b;
+            --surface-action-hover: #252b36;
+            --surface-muted: rgba(255, 255, 255, 0.03);
+            --surface-muted-hover: rgba(255, 255, 255, 0.06);
+            --overlay: rgba(0, 0, 0, 0.85);
+            --nav-active-text: #fff;
+            --on-accent: #fff;
+        }
+        :root[data-theme="light"] {
+            color-scheme: light;
+            --bg: #f5f7fa;
+            --card: #ffffff;
+            --header: #ffffff;
+            --border: #d8dee8;
+            --text: #111827;
+            --text-dim: #5f6b7a;
+            --accent: #0878c9;
+            --accent-hover: #0668ad;
+            --green: #087f5b;
+            --red: #d92d3a;
+            --blue-tip: rgba(8, 120, 201, 0.08);
+            --surface-strong: #eef2f7;
+            --surface-input: #ffffff;
+            --surface-elevated: #ffffff;
+            --surface-action: #eef2f7;
+            --surface-action-hover: #e2e8f0;
+            --surface-muted: rgba(15, 23, 42, 0.04);
+            --surface-muted-hover: rgba(15, 23, 42, 0.08);
+            --overlay: rgba(15, 23, 42, 0.58);
+            --nav-active-text: #0f172a;
+            --on-accent: #ffffff;
         }
         * { box-sizing: border-box; }
         body { 
@@ -782,19 +828,19 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             display: flex; align-items: center; gap: 15px;
         }
         .status-container {
-            background: #000;
+            background: var(--surface-strong);
             border: 1px solid var(--border);
             border-radius: 50px;
             padding: 5px 5px 5px 24px;
             display: flex; align-items: center; min-width: 320px;
         }
         .status-label { font-size: 13px; font-weight: 700; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
-        .inline-p-con { width: 100px; height: 4px; background: #1a1a1a; border-radius: 10px; margin: 0 20px; display: none; overflow: hidden; }
+        .inline-p-con { width: 100px; height: 4px; background: var(--border); border-radius: 10px; margin: 0 20px; display: none; overflow: hidden; }
         .inline-p-bar { height: 100%; width: 0%; background: var(--accent); border-radius: 10px; transition: 0.4s; }
 
         .run-btn {
             background: linear-gradient(135deg, #1d9bf0 0%, #1a8cd8 100%);
-            color: white; border: none; padding: 12px 28px; border-radius: 40px;
+            color: var(--on-accent); border: none; padding: 12px 28px; border-radius: 40px;
             font-weight: 800; cursor: pointer; display: flex; align-items: center; gap: 10px;
             transition: 0.2s; box-shadow: 0 5px 15px rgba(29, 155, 240, 0.35);
             font-size: 14px; margin-left: auto;
@@ -819,11 +865,11 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             padding: 10px 18px; border-radius: 12px;
             white-space: nowrap;
         }
-        .nav-link:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+        .nav-link:hover { color: var(--text); background: var(--surface-muted); }
         .guide-list { margin-top: 15px; padding-left: 20px; }
         .guide-list li { margin-bottom: 10px; color: var(--text-dim); line-height: 1.6; }
         .nav-link.active { 
-            color: #fff; 
+            color: var(--nav-active-text);
             background: #1d9bf025;
             border: 1px solid #1d9bf040;
         }
@@ -837,7 +883,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         
         label { display: block; font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 12px; }
         input, select, textarea { 
-            width: 100%; background: #080a0f; border: 1px solid var(--border); color: var(--text); 
+            width: 100%; background: var(--surface-input); border: 1px solid var(--border); color: var(--text);
             padding: 15px 18px; border-radius: 12px; margin-bottom: 20px; font-family: inherit; font-size: 14px;
         }
         input:focus, textarea:focus { border-color: var(--accent); outline: none; }
@@ -852,15 +898,15 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         .tip-list { margin: 0; padding-left: 18px; font-size: 12px; color: var(--text-dim); line-height: 1.8; }
 
         .btn-full { width: 100%; justify-content: center; }
-        .btn-save { background: #ffffff08; border: 1px solid var(--border); color: #fff; }
-        .btn-save:hover { background: #ffffff12; }
+        .btn-save { background: var(--surface-muted); border: 1px solid var(--border); color: var(--text); }
+        .btn-save:hover { background: var(--surface-muted-hover); }
 
         /* ProgressOverlay */
         #progress-overlay {
-            position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: none; align-items: center; justify-content: center; z-index: 1000;
+            position: fixed; inset: 0; background: var(--overlay); display: none; align-items: center; justify-content: center; z-index: 1000;
         }
         .p-box { width: 440px; background: var(--card); border: 1px solid var(--border); padding: 48px; border-radius: 32px; text-align: center; }
-        .p-bar-con { height: 8px; background: #000; border-radius: 10px; margin: 30px 0; overflow: hidden; }
+        .p-bar-con { height: 8px; background: var(--surface-strong); border-radius: 10px; margin: 30px 0; overflow: hidden; }
         .p-bar { height: 100%; background: var(--accent); width: 0%; transition: 0.4s; }
 
         /* Storage & History Styling */
@@ -869,7 +915,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             border-radius: 12px; padding: 40px; margin-bottom: 50px;
         }
         .path-display { 
-            background: #000; border: 1px solid var(--border); border-radius: 8px; 
+            background: var(--surface-strong); border: 1px solid var(--border); border-radius: 8px;
             padding: 18px 25px; font-family: 'Consolas', monospace; font-size: 13px; color: var(--text-dim);
             margin: 25px 0; width: 100%;
         }
@@ -878,7 +924,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         .report-count { font-size: 13px; color: var(--text-dim); }
 
         .report-card { 
-            background: #151921; border: 1px solid var(--border); border-radius: 16px; 
+            background: var(--surface-elevated); border: 1px solid var(--border); border-radius: 16px;
             padding: 30px 40px; margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center;
         }
         .report-info .r-title { font-weight: 800; font-size: 19px; color: var(--accent); margin-bottom: 10px; display: block; }
@@ -886,11 +932,11 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         
         .report-actions { display: flex; gap: 15px; }
         .btn-action { 
-            background: #1e232b; border: 1px solid #2d343f; color: var(--text);
+            background: var(--surface-action); border: 1px solid var(--border); color: var(--text);
             padding: 10px 22px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer;
             transition: 0.2s; display: flex; align-items: center; gap: 10px;
         }
-        .btn-action:hover { background: #252b36; border-color: #3d4654; }
+        .btn-action:hover { background: var(--surface-action-hover); border-color: var(--border); }
         .icon-small { font-size: 14px; opacity: 0.8; }
         .h-img { width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--border); margin-right: 15px; flex-shrink: 0; }
         .report-info-con { display: flex; align-items: center; flex: 1; }
@@ -906,8 +952,8 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             border-radius: 12px;
             display: inline-block;
             font-weight: 700;
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: var(--surface-muted);
+            border: 1px solid var(--border);
             user-select: none;
         }
         .cloud-word:hover {
@@ -926,7 +972,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         }
 
         .prof-detail-card {
-            background: rgba(0,0,0,0.3);
+            background: var(--surface-muted);
             border: 1px solid var(--border);
             border-radius: 16px;
             overflow: hidden;
@@ -934,9 +980,9 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             animation: fadeIn 0.4s ease-out;
         }
         .prof-table { width: 100%; border-collapse: collapse; }
-        .prof-table th { background: rgba(255,255,255,0.03); padding: 15px; text-align: left; font-size: 11px; text-transform: uppercase; color: var(--text-dim); }
+        .prof-table th { background: var(--surface-muted); padding: 15px; text-align: left; font-size: 11px; text-transform: uppercase; color: var(--text-dim); }
         .prof-table td { padding: 15px; border-top: 1px solid var(--border); font-size: 14px; }
-        .prof-table tr:hover { background: rgba(255,255,255,0.02); }
+        .prof-table tr:hover { background: var(--surface-muted); }
         .word-tag { 
             background: var(--accent); color: #fff; padding: 4px 12px; border-radius: 20px; 
             font-size: 13px; font-weight: 800; display: inline-block; margin-bottom: 20px;
@@ -1000,9 +1046,44 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         }
         .info-trigger:hover { background: var(--accent); color: #fff; transform: scale(1.1); }
 
+        .theme-toggle {
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            z-index: 1500;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 44px;
+            padding: 10px 16px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--card);
+            color: var(--text);
+            box-shadow: 0 8px 28px rgba(15, 23, 42, 0.18);
+            font: inherit;
+            font-size: 13px;
+            font-weight: 800;
+            cursor: pointer;
+        }
+        .theme-toggle:hover { background: var(--surface-action-hover); }
+        .theme-toggle:focus-visible { outline: 3px solid rgba(29, 155, 240, 0.35); outline-offset: 2px; }
+        :root[data-theme="light"] #prof_user,
+        :root[data-theme="light"] #meth_toggle_btn {
+            background: var(--surface-input) !important;
+            color: var(--text) !important;
+        }
+        :root[data-theme="light"] #profiler > .card {
+            background: var(--card) !important;
+        }
+
     </style>
 </head>
 <body>
+    <button type="button" class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" aria-label="切换到白天模式" aria-pressed="false">
+        <span id="theme-toggle-icon" aria-hidden="true">☀️</span>
+        <span id="theme-toggle-label">白天模式</span>
+    </button>
     <header>
         <div class="main-nav">
             <div class="logo-area" onclick="resetApp()">
@@ -1070,7 +1151,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 <div style="font-weight: 800; font-size: 18px; margin-bottom: 20px;">Search X Username</div>
                 <div style="position: relative; display: flex; gap: 10px;">
                     <span style="position: absolute; left: 20px; top: 50%; transform: translateY(-50%); color: var(--accent); font-weight: 800; font-size: 18px;">@</span>
-                    <input type="text" id="prof_user" placeholder="username" style="width: 100%; background: #000; border: 1px solid var(--border); padding: 16px 16px 16px 45px; border-radius: 12px; color: #fff; font-size: 16px; font-weight: 600; margin-bottom: 0;">
+                    <input type="text" id="prof_user" placeholder="username" style="width: 100%; background: var(--surface-input); border: 1px solid var(--border); padding: 16px 16px 16px 45px; border-radius: 12px; color: var(--text); font-size: 16px; font-weight: 600; margin-bottom: 0;">
                     <button onclick="generateProfile()" id="prof_btn" class="run-btn" style="margin: 0; padding: 0 30px;">Analyze</button>
                 </div>
             </div>
@@ -1364,6 +1445,31 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         function safeInteger(value) {
             const parsed = Number.parseInt(value, 10);
             return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+        }
+
+        const THEME_STORAGE_KEY = 'xls-theme';
+
+        function updateThemeButton() {
+            const isLight = document.documentElement.dataset.theme === 'light';
+            const button = document.getElementById('theme-toggle');
+            const icon = document.getElementById('theme-toggle-icon');
+            const label = document.getElementById('theme-toggle-label');
+            if (!button || !icon || !label) return;
+            icon.textContent = isLight ? '🌙' : '☀️';
+            label.textContent = isLight ? '夜间模式' : '白天模式';
+            button.setAttribute('aria-label', isLight ? '切换到夜间模式' : '切换到白天模式');
+            button.setAttribute('aria-pressed', String(isLight));
+        }
+
+        function toggleTheme() {
+            const nextTheme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+            document.documentElement.dataset.theme = nextTheme;
+            try {
+                localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+            } catch (_) {
+                // The visual switch still works when storage is unavailable.
+            }
+            updateThemeButton();
         }
 
         async function controlPost(path, payload = {}) {
@@ -1900,6 +2006,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             }
         }
 
+        updateThemeButton();
         loadConfig();
         setInterval(poll, 1500);
     </script>
