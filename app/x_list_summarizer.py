@@ -3,7 +3,7 @@ import re
 import json
 import os
 import sys
-import html
+import logging
 import threading
 import webbrowser
 from datetime import datetime
@@ -12,7 +12,31 @@ from collections import defaultdict
 from twikit import Client
 import httpx
 import base64
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
+
+try:
+    from .security import (
+        escape_html_text,
+        redact_sensitive_text,
+        safe_html_attribute,
+        safe_image_src_attribute,
+        safe_url_attribute,
+        sanitize_external_url,
+        sanitize_image_src,
+    )
+except ImportError:  # Compatibility with `python app/web_ui.py`.
+    from security import (
+        escape_html_text,
+        redact_sensitive_text,
+        safe_html_attribute,
+        safe_image_src_attribute,
+        safe_url_attribute,
+        sanitize_external_url,
+        sanitize_image_src,
+    )
+
+
+logger = logging.getLogger(__name__)
 
 class XListFetcher:
     """Class to fetch and process tweets from X lists with premium reporting."""
@@ -32,6 +56,18 @@ class XListFetcher:
         self.user_cache_path = self.cache_dir / 'user_ids.json'
         self.user_cache = self._load_user_cache()
 
+    def _safe_error(self, error):
+        """Return an exception message with X session credentials removed."""
+        secrets = []
+        try:
+            cookies = self.client.get_cookies()
+            if isinstance(cookies, dict):
+                secrets.extend((cookies.get('auth_token'), cookies.get('ct0')))
+        except Exception:
+            # Error reporting must never hide the original failure.
+            pass
+        return redact_sensitive_text(str(error), secrets=secrets)
+
     def _load_user_cache(self):
         """Load username -> User ID mapping from local cache."""
         if not self.user_cache_path.exists():
@@ -39,7 +75,7 @@ class XListFetcher:
         try:
             with open(self.user_cache_path, 'r') as f:
                 return json.load(f)
-        except:
+        except (OSError, ValueError, json.JSONDecodeError):
             return {}
 
     def _save_user_cache(self):
@@ -48,7 +84,7 @@ class XListFetcher:
         try:
             with open(self.user_cache_path, 'w') as f:
                 json.dump(self.user_cache, f)
-        except:
+        except OSError:
             pass
 
     async def get_user_id(self, username: str) -> str:
@@ -77,9 +113,8 @@ class XListFetcher:
             user = await self.client.user()
             return True, f"Logged in as @{user.screen_name}"
         except Exception as e:
-            import traceback
-            print(f"[Login Traceback]\n{traceback.format_exc()}")
-            err = str(e)
+            logger.warning("Twikit login verification failed (%s)", type(e).__name__)
+            err = self._safe_error(e)
             # 401 = definitively expired/invalid — hard fail
             if '401' in err:
                 return False, f"Session expired (401). Please re-import your cookies."
@@ -110,7 +145,7 @@ class XListFetcher:
                 user = await self.client.user()
                 return True, f"OK (@{user.screen_name})"
             except Exception as e:
-                last_err = str(e)
+                last_err = self._safe_error(e)
                 # If it's a 401, don't retry, it's definitive
                 if '401' in last_err: break
                 # If it's a rate limit or 404, wait a tiny bit and retry
@@ -165,7 +200,7 @@ class XListFetcher:
             print(f"✅ Found {len(memberships)} memberships for {username}")
             return memberships
         except Exception as e:
-            print(f"❌ Error fetching memberships for {username}: {e}")
+            print(f"❌ Error fetching memberships for {username}: {self._safe_error(e)}")
             return []
 
     def extract_list_id(self, url_or_id: str) -> str:
@@ -191,7 +226,7 @@ class XListFetcher:
                 if resp.status_code in [301, 302]:
                     loc = resp.headers.get('location', '')
                     return self.extract_owner_from_url(loc)
-            except:
+            except httpx.HTTPError:
                 pass
         return None
 
@@ -220,7 +255,7 @@ class XListFetcher:
                 owner_obj = getattr(l_info, 'user', getattr(l_info, 'creator', None))
                 print(f"✅ List info via twikit: '{list_name}', {member_count_for_list} members")
             except Exception as _e:
-                print(f"⚠️ get_list() failed for {list_id}: {_e} — trying v1.1 fallback")
+                print(f"⚠️ get_list() failed for {list_id}: {self._safe_error(_e)} — trying v1.1 fallback")
                 try:
                     v1_url = f'https://api.twitter.com/1.1/lists/show.json?list_id={list_id}'
                     v1_resp, _ = await self.client.get(v1_url, headers=self.client._base_headers)
@@ -229,7 +264,7 @@ class XListFetcher:
                         member_count_for_list = v1_resp.get('member_count', 0)
                         print(f"✅ List info via v1.1: '{list_name}', {member_count_for_list} members")
                 except Exception as _e2:
-                    print(f"⚠️ v1.1 list info also failed for {list_id}: {_e2}")
+                    print(f"⚠️ v1.1 list info also failed for {list_id}: {self._safe_error(_e2)}")
 
             if list_name:
                 self.list_info['list_names'].append(list_name)
@@ -244,7 +279,8 @@ class XListFetcher:
                     self.list_info['owner'] = self.list_owner_pref
                     self.list_info['owner_name'] = getattr(u_info, 'name', self.list_owner_pref)
                     self.list_info['profile_image_url'] = getattr(u_info, 'profile_image_url', None)
-                except: pass
+                except Exception as exc:
+                    logger.debug("Could not resolve preferred list owner (%s)", type(exc).__name__)
 
             if not self.list_info['profile_image_url'] and owner_obj:
                 self.list_info['owner'] = getattr(owner_obj, 'screen_name', self.list_info['owner'])
@@ -331,7 +367,8 @@ class XListFetcher:
                                 res['image'] = bv['player_image'].get('image_value', {}).get('url')
                                 
                             if res.get('title'): return res
-                        except: pass
+                        except (AttributeError, KeyError, TypeError, ValueError):
+                            pass
                         return None
 
                     tweet_card = extract_card(tweet)
@@ -363,15 +400,18 @@ class XListFetcher:
             
             return tweets
         except Exception as e:
-            err = str(e)
+            err = self._safe_error(e)
             # Re-raise rate limit and auth errors so the caller can show a clear message
             if '429' in err or 'rate limit' in err.lower():
                 raise Exception(f"X Rate Limit reached fetching list {list_id}. Please wait 15 minutes and try again.") from e
             if '401' in err or 'unauthorized' in err.lower():
                 raise Exception(f"X session unauthorized (401) fetching list {list_id}. Please re-import your cookies via Settings → X Account.") from e
-            # Non-fatal errors (e.g. intermittent network): log and return whatever we got
+            # Preserve already-fetched pages, but surface complete list failures
+            # so the task runner can report partial success accurately.
             print(f"❌ Error fetching list {list_id}: {err}")
-            return tweets
+            if tweets:
+                return tweets
+            raise RuntimeError(f"X list {list_id} fetch failed: {err}") from e
 
     def aggregate_by_links(self, tweets: list) -> dict:
         """Group tweets by link and sort by engagement, weighted by author diversity."""
@@ -429,21 +469,37 @@ class XListFetcher:
         """Build HTML for a link preview card inside a tweet."""
         card = tweet_data.get('card')
         if not card: return ""
-        
+
         # Determine target URL from links if not in card
-        url = tweet_data['links'][0] if tweet_data.get('links') else "#"
-        
-        img_html = f'<div class="tc-img"><img src="{card["image"]}" loading="lazy"></div>' if card.get('image') else ""
-        desc_html = f'<div class="tc-desc">{card["description"]}</div>' if card.get('description') else ""
-        
+        url = sanitize_external_url(
+            tweet_data['links'][0] if tweet_data.get('links') else ""
+        )
+        if not url:
+            return ""
+
+        title = escape_html_text(card.get('title', ''))
+        if not title:
+            return ""
+
+        image_url = sanitize_image_src(card.get('image', ''))
+        img_html = (
+            f'<div class="tc-img"><img src="{safe_image_src_attribute(image_url)}" '
+            'loading="lazy" alt=""></div>'
+            if image_url else ""
+        )
+        description = escape_html_text(card.get('description', ''))
+        desc_html = f'<div class="tc-desc">{description}</div>' if description else ""
+        url_attr = safe_url_attribute(url)
+        domain = escape_html_text(self._extract_domain(url))
+
         return f'''
-        <a href="{url}" target="_blank" rel="noopener" class="tweet-card-link">
+        <a href="{url_attr}" target="_blank" rel="noopener noreferrer" class="tweet-card-link">
             <div class="tc-container">
                 {img_html}
                 <div class="tc-content">
-                    <div class="tc-title">{card["title"]}</div>
+                    <div class="tc-title">{title}</div>
                     {desc_html}
-                    <div class="tc-site">{self._extract_domain(url)}</div>
+                    <div class="tc-site">{domain}</div>
                 </div>
             </div>
         </a>'''
@@ -462,24 +518,41 @@ class XListFetcher:
                     continue  # duplicate — already shown in this group
                 seen_urls.add(url_key)
 
-            if m['type'] == 'photo':
-                html_parts.append(f'<div class="media-item"><img src="{m["url"]}" loading="lazy"></div>')
-            elif m['type'] == 'animated_gif':
+            if m.get('type') == 'photo':
+                image_url = sanitize_image_src(m.get('url', ''))
+                if image_url:
+                    html_parts.append(
+                        f'<div class="media-item"><img src="{safe_image_src_attribute(image_url)}" '
+                        'loading="lazy" alt=""></div>'
+                    )
+            elif m.get('type') == 'animated_gif':
+                video_url = sanitize_external_url(m.get('url', ''))
+                poster_url = sanitize_image_src(m.get('thumbnail', ''))
+                if not video_url:
+                    continue
+                poster_attr = (
+                    f' poster="{safe_image_src_attribute(poster_url)}"'
+                    if poster_url else ""
+                )
                 html_parts.append(f'''
                 <div class="media-item">
-                    <video playsinline autoplay loop muted poster="{m.get("thumbnail")}">
-                        <source src="{m["url"]}" type="video/mp4">
+                    <video playsinline autoplay loop muted{poster_attr}>
+                        <source src="{safe_url_attribute(video_url)}" type="video/mp4">
                     </video>
                 </div>''')
-            elif m['type'] == 'video':
+            elif m.get('type') == 'video':
                 # X video CDN requires session auth — show poster thumbnail with play overlay
-                tweet_url = f"https://x.com/{tweet.get('author', 'i')}/status/{tweet.get('id', '')}"
-                thumb = m.get('thumbnail', '')
+                author_path = quote(str(tweet.get('author', 'i')), safe='')
+                tweet_id_path = quote(str(tweet.get('id', '')), safe='')
+                tweet_url = sanitize_external_url(
+                    f"https://x.com/{author_path}/status/{tweet_id_path}"
+                )
+                thumb = sanitize_image_src(m.get('thumbnail', ''))
                 if thumb:
                     html_parts.append(f'''
                     <div class="media-item">
-                        <a href="{tweet_url}" target="_blank" rel="noopener" class="video-thumb-link" title="Watch on X">
-                            <img src="{thumb}" loading="lazy">
+                        <a href="{safe_url_attribute(tweet_url)}" target="_blank" rel="noopener noreferrer" class="video-thumb-link" title="Watch on X">
+                            <img src="{safe_image_src_attribute(thumb)}" loading="lazy" alt="">
                             <div class="play-overlay">&#9654;</div>
                         </a>
                     </div>''')
@@ -490,25 +563,42 @@ class XListFetcher:
     def _extract_domain(self, url):
         """Extract domain from URL."""
         try:
-            domain = urlparse(url).netloc
+            safe_url = sanitize_external_url(url)
+            if not safe_url:
+                return ""
+            domain = urlparse(safe_url).hostname or ""
             return domain.replace('www.', '')
-        except:
+        except (TypeError, ValueError):
             return ""
 
     def _build_link_card(self, url):
         """Build a link card component with a high-quality favicon."""
+        url = sanitize_external_url(url)
+        if not url:
+            return ""
         domain = self._extract_domain(url)
+        if not domain:
+            return ""
+
+        url_attr = safe_url_attribute(url)
+        domain_text = escape_html_text(domain)
         
         # YouTube Special Case
         if 'youtube.com' in domain or 'youtu.be' in domain:
-            y_id = url.split('v=')[-1].split('&')[0] if 'v=' in url else url.split('/')[-1]
-            return f'''
-            <div class="l-card">
-                <div class="l-dom">YOUTUBE</div>
-                <div class="v-con">
-                    <iframe src="https://www.youtube.com/embed/{y_id}" allowfullscreen></iframe>
-                </div>
-            </div>'''
+            parsed = urlparse(url)
+            if domain.endswith('youtu.be'):
+                y_id = parsed.path.strip('/').split('/')[0]
+            else:
+                y_id = parse_qs(parsed.query).get('v', [''])[0]
+            if re.fullmatch(r'[A-Za-z0-9_-]{6,20}', y_id or ''):
+                embed_url = safe_url_attribute(f"https://www.youtube.com/embed/{y_id}")
+                return f'''
+                <div class="l-card">
+                    <div class="l-dom">YOUTUBE</div>
+                    <div class="v-con">
+                        <iframe src="{embed_url}" allowfullscreen></iframe>
+                    </div>
+                </div>'''
             
         # Standard Link Card with Favicon
         favicon_url = f"https://www.google.com/s2/favicons?domain={domain}&sz=64"
@@ -516,12 +606,12 @@ class XListFetcher:
         return f'''
         <div class="shared-content">
             <div class="link-card">
-                <a href="{url}" target="_blank" rel="noopener" class="link-icon-wrap">
-                    <img src="{favicon_url}" class="link-icon-img" onerror="this.src='https://abs.twimg.com/responsive-web/client-web/icon-ios.b1fdcd7a.png'">
+                <a href="{url_attr}" target="_blank" rel="noopener noreferrer" class="link-icon-wrap">
+                    <img src="{safe_image_src_attribute(favicon_url)}" class="link-icon-img" alt="">
                 </a>
                 <div class="link-details">
-                    <div class="link-domain">{domain}</div>
-                    <a href="{url}" target="_blank" rel="noopener" class="link-url-text">{url}</a>
+                    <div class="link-domain">{domain_text}</div>
+                    <a href="{url_attr}" target="_blank" rel="noopener noreferrer" class="link-url-text">{escape_html_text(url)}</a>
                 </div>
             </div>
         </div>'''
@@ -564,6 +654,13 @@ class XListFetcher:
         """Standardized HTML Report generator."""
         timestamp = datetime.now().strftime("%B %d, %Y at %I:%M %p")
         link_count = len(aggregated['by_link'])
+
+        def metric(value):
+            """Coerce untrusted metric values to safe non-negative integers."""
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return 0
         
         # Logo as Base64
         logo_uri = "icon.png"
@@ -573,15 +670,25 @@ class XListFetcher:
                 with open(icon_path, "rb") as image_file:
                     encoded_string = base64.b64encode(image_file.read()).decode()
                     logo_uri = f"data:image/png;base64,{encoded_string}"
-        except: pass
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not embed report icon (%s)", type(exc).__name__)
 
         # Build display title from all fetched list names
         list_names = self.list_info.get('list_names', [])
         if not list_names:
             list_names = [self.list_info.get('name', 'X List Summary')]
-        display_title = ' &amp; '.join(list_names)
+        display_title = safe_html_attribute(
+            ' & '.join(str(name) for name in list_names if name)
+            or 'X List Summary'
+        )
 
-        owner_info = f"by {self.list_info['owner_name'] or 'Unknown'} (@{self.list_info['owner']}) &bull; {self.list_info['member_count']:,} members total"
+        owner_name = escape_html_text(self.list_info.get('owner_name') or 'Unknown')
+        owner_handle = escape_html_text(self.list_info.get('owner') or 'Unknown')
+        member_count = metric(self.list_info.get('member_count', 0))
+        owner_info = (
+            f"by {owner_name} (@{owner_handle}) &bull; "
+            f"{member_count:,} members total"
+        )
         
         # Parse AI insights into lookup dict (keyed by URL and/or domain)
         insights = self._parse_ai_insights(ai_summary)
@@ -589,7 +696,8 @@ class XListFetcher:
         # Build "Most Shared Content & Why" table with inline expandable tweet rows
         table_rows = ""
         for i, (link, tweets) in enumerate(aggregated['by_link'][:20]):
-            domain = self._extract_domain(link)
+            safe_link = sanitize_external_url(link)
+            domain = self._extract_domain(safe_link)
             # Lookup priority: 1) exact URL, 2) truncated URL (as sent to AI), 3) domain, 4) base domain
             key_80 = link[:80] if len(link) > 80 else link
             why = (insights.get(link)
@@ -599,28 +707,54 @@ class XListFetcher:
                    or insights.get(domain))
             if not why:
                 base = '.'.join(domain.split('.')[-2:]) if domain.count('.') >= 2 else domain
-                why = insights.get(base, '&mdash;')
+                why = insights.get(base)
+            why_html = escape_html_text(why) if why else '&mdash;'
             count = len(tweets)
             label = str(count)
-            favicon = f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+            favicon = (
+                f"https://www.google.com/s2/favicons?domain={domain}&sz=32"
+                if domain else ""
+            )
+            if safe_link:
+                content_label = escape_html_text(domain or safe_link)
+                content_html = (
+                    f'<a href="{safe_url_attribute(safe_link)}" target="_blank" '
+                    f'rel="noopener noreferrer" class="t-link">{content_label}</a>'
+                )
+            else:
+                content_html = (
+                    f'<span class="t-link">{escape_html_text(link)}</span>'
+                )
+            favicon_html = (
+                f'<img src="{safe_image_src_attribute(favicon)}" class="t-fav" alt="">'
+                if favicon else ""
+            )
 
             # Build the tweet list for this link's expand row (dedup media across retweets)
             tweet_list = ""
             group_seen_media = set()
             for t in tweets[:5]:
-                tweet_url = f"https://x.com/{t['author']}/status/{t['id']}"
+                author_raw = str(t.get('author', 'unknown'))
+                author_path = quote(author_raw, safe='')
+                tweet_id_path = quote(str(t.get('id', '')), safe='')
+                tweet_url = sanitize_external_url(
+                    f"https://x.com/{author_path}/status/{tweet_id_path}"
+                )
+                tweet_url_attr = safe_url_attribute(tweet_url)
+                author_text = escape_html_text(author_raw)
+                tweet_text = escape_html_text(t.get('text', ''))
                 media_html = self._build_media_html(t, seen_urls=group_seen_media)
                 card_html = self._build_card_html(t)
                 tweet_list += f'''
                     <div class="tweet">
                         <div class="tweet-header">
-                            <a href="{tweet_url}" target="_blank" rel="noopener" class="author">@{t['author']} &#8599;</a>
+                            <a href="{tweet_url_attr}" target="_blank" rel="noopener noreferrer" class="author">@{author_text} &#8599;</a>
                             <div class="tweet-meta">
-                                <span class="metrics">&#10084;&#65039; {t['likes']} | &#128260; {t['retweets']} | &#128172; {t['replies']} | &#128279; {t['bookmarks']}</span>
-                                <a href="{tweet_url}" target="_blank" rel="noopener" class="view-tweet">View Tweet</a>
+                                <span class="metrics">&#10084;&#65039; {metric(t.get('likes'))} | &#128260; {metric(t.get('retweets'))} | &#128172; {metric(t.get('replies'))} | &#128279; {metric(t.get('bookmarks'))}</span>
+                                <a href="{tweet_url_attr}" target="_blank" rel="noopener noreferrer" class="view-tweet">View Tweet</a>
                             </div>
                         </div>
-                        <p class="tweet-text">{t['text']}</p>
+                        <p class="tweet-text">{tweet_text}</p>
                         {media_html}
                         {card_html}
                     </div>'''
@@ -629,14 +763,14 @@ class XListFetcher:
                 <tr class="insight-row" id="insight-row-{i}">
                     <td class="t-name">
                         <div class="t-domain-wrap">
-                            <img src="{favicon}" class="t-fav" onerror="this.style.display='none'">
-                            <a href="{link}" target="_blank" rel="noopener" class="t-link">{domain}</a>
+                            {favicon_html}
+                            {content_html}
                         </div>
                     </td>
                     <td class="t-count-cell">
                         <a class="tweet-expand-link" data-idx="{i}" onclick="toggleRow({i}); return false;">{label} <span class="expand-arrow" id="arrow-{i}">&#9660;</span></a>
                     </td>
-                    <td class="t-why">{why}</td>
+                    <td class="t-why">{why_html}</td>
                 </tr>
                 <tr class="tweet-expand-row" id="tweets-{i}">
                     <td colspan="3" class="tweet-expand-cell">
@@ -663,7 +797,13 @@ class XListFetcher:
         # Build individual tweets section (compact grid, 3 per row)
         individual_html = ""
         for t in aggregated['no_links'][:30]:
-            tweet_url = f"https://x.com/{t['author']}/status/{t['id']}"
+            author_raw = str(t.get('author', 'unknown'))
+            author_path = quote(author_raw, safe='')
+            tweet_id_path = quote(str(t.get('id', '')), safe='')
+            tweet_url = sanitize_external_url(
+                f"https://x.com/{author_path}/status/{tweet_id_path}"
+            )
+            tweet_url_attr = safe_url_attribute(tweet_url)
             text_raw = t.get('text', '') or ''
             text_snip = (text_raw[:220] + '…') if len(text_raw) > 220 else text_raw
             media_html = self._build_media_html(t)
@@ -671,27 +811,40 @@ class XListFetcher:
             individual_html += f'''
             <div class="tweet-mini">
                 <div class="tm-head">
-                    <a href="{tweet_url}" target="_blank" rel="noopener" class="tm-author">@{t['author']} <span class="tm-arrow">&#8599;</span></a>
+                    <a href="{tweet_url_attr}" target="_blank" rel="noopener noreferrer" class="tm-author">@{escape_html_text(author_raw)} <span class="tm-arrow">&#8599;</span></a>
                 </div>
-                <p class="tm-text">{text_snip}</p>
+                <p class="tm-text">{escape_html_text(text_snip)}</p>
                 {media_html}
                 {card_html}
-                <div class="tm-metrics">&#10084;&#65039; {t['likes']} &nbsp;&#128260; {t['retweets']} &nbsp;&#128172; {t['replies']}</div>
+                <div class="tm-metrics">&#10084;&#65039; {metric(t.get('likes'))} &nbsp;&#128260; {metric(t.get('retweets'))} &nbsp;&#128172; {metric(t.get('replies'))}</div>
             </div>'''
 
-        ai_model_html = f'<div class="gen-model">&#129302; AI Analysis by {ai_model}</div>' if ai_model else ''
+        ai_model_html = (
+            f'<div class="gen-model">&#129302; AI Analysis by {escape_html_text(ai_model)}</div>'
+            if ai_model else ''
+        )
+
+        fallback_profile = 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png'
+        profile_img = sanitize_image_src(
+            self.list_info.get('profile_image_url'), fallback=fallback_profile
+        )
+        safe_logo_uri = safe_image_src_attribute(
+            logo_uri,
+            fallback=fallback_profile,
+            allow_data_image=True,
+        )
 
         report_html = self._get_report_template().format(
             title=display_title,
             owner_line=owner_info,
-            tweet_count=tweet_count,
+            tweet_count=metric(tweet_count),
             link_count=link_count,
             timestamp=timestamp,
             ai_model_html=ai_model_html,
-            logo_uri=logo_uri,
+            logo_uri=safe_logo_uri,
             insights=insights_html,
             individual=individual_html,
-            profile_img=self.list_info.get('profile_image_url') or 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png'
+            profile_img=safe_image_src_attribute(profile_img)
         )
         
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -873,7 +1026,7 @@ class XListFetcher:
 <body>
     <div class="con">
         <div class="page-header">
-            <img src="{logo_uri}" class="main-logo" onerror="this.src='https://abs.twimg.com/responsive-web/client-web/icon-ios.b1fdcd7a.png'">
+            <img src="{logo_uri}" class="main-logo" alt="">
             <h1 class="main-title">X List Summary</h1>
             <div class="gen-date">Generated on {timestamp}</div>
             {ai_model_html}
@@ -938,6 +1091,13 @@ class XApiFetcher(XListFetcher):
         super().__init__(cookies_path='browser_session/cookies.json', list_owner=list_owner)
         self.bearer_token = (bearer_token or '').strip()
 
+    def _safe_error(self, error):
+        """Return an API exception message with the Bearer Token removed."""
+        return redact_sensitive_text(
+            super()._safe_error(error),
+            secrets=(getattr(self, 'bearer_token', ''),),
+        )
+
     def _headers(self):
         return {'Authorization': f'Bearer {self.bearer_token}', 'User-Agent': 'x-list-summarizer/1.0'}
 
@@ -949,7 +1109,7 @@ class XApiFetcher(XListFetcher):
             if resp.status_code == 429:
                 raise Exception("429 Rate limit — X API quota exceeded.")
             if resp.status_code >= 400:
-                raise Exception(f"X API error {resp.status_code}: {resp.text[:200]}")
+                raise Exception(f"X API error {resp.status_code}.")
             return resp.json()
 
     async def login(self):
@@ -960,7 +1120,8 @@ class XApiFetcher(XListFetcher):
             await self._get('/users/by/username/x')
             return True, "Bearer Token OK"
         except Exception as e:
-            return False, f"Login failed: {str(e)[:120]}"
+            safe_error = self._safe_error(e)
+            return False, f"Login failed: {safe_error[:120]}"
 
     async def verify_session(self, retries=1):
         if not self.bearer_token:
@@ -970,7 +1131,7 @@ class XApiFetcher(XListFetcher):
                 await self._get('/users/by/username/x')
                 return True, "OK (API)"
             except Exception as e:
-                err = str(e)
+                err = self._safe_error(e)
                 if '401' in err:
                     return False, "Invalid Bearer Token (401)"
                 if attempt < retries:
@@ -1017,7 +1178,7 @@ class XApiFetcher(XListFetcher):
             print(f"✅ Found {len(memberships)} memberships for {username} (API)")
             return memberships
         except Exception as e:
-            print(f"❌ Error fetching memberships for {username} via API: {e}")
+            print(f"❌ Error fetching memberships for {username} via API: {self._safe_error(e)}")
             return []
 
     async def _fetch_list_metadata(self, list_id: str):
@@ -1037,7 +1198,7 @@ class XApiFetcher(XListFetcher):
                 'profile_image_url': owner.get('profile_image_url'),
             }
         except Exception as e:
-            print(f"⚠️ get_list via API failed for {list_id}: {e}")
+            print(f"⚠️ get_list via API failed for {list_id}: {self._safe_error(e)}")
             return {}
 
     async def fetch_list_tweets(self, list_url_or_id: str, max_tweets: int = 100, delay: float = 0):
@@ -1063,7 +1224,8 @@ class XApiFetcher(XListFetcher):
                 self.list_info['owner'] = self.list_owner_pref
                 self.list_info['owner_name'] = u.get('name', self.list_owner_pref)
                 self.list_info['profile_image_url'] = u.get('profile_image_url')
-            except: pass
+            except Exception as exc:
+                logger.debug("Could not resolve preferred API list owner (%s)", type(exc).__name__)
 
         if not self.list_info['profile_image_url'] and meta.get('owner_screen_name'):
             self.list_info['owner'] = meta['owner_screen_name']
@@ -1151,10 +1313,12 @@ class XApiFetcher(XListFetcher):
 
             return tweets
         except Exception as e:
-            err = str(e)
+            err = self._safe_error(e)
             if '429' in err:
                 raise Exception(f"X API rate limit fetching list {list_id}. Please wait and try again.") from e
             if '401' in err:
                 raise Exception(f"X API unauthorized (401) fetching list {list_id}. Please check your Bearer Token in Settings.") from e
             print(f"❌ Error fetching list {list_id} via API: {err}")
-            return tweets
+            if tweets:
+                return tweets
+            raise RuntimeError(f"X API list {list_id} fetch failed: {err}") from e

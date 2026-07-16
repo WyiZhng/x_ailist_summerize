@@ -1,22 +1,40 @@
 import http.server
 from http.server import ThreadingHTTPServer
-import socketserver
 import json
+import logging
+import mimetypes
 import os
+import random
+import re
+import subprocess
 import sys
 import threading
 import time
 import webbrowser
 import asyncio
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 
-# Add app to path for imports
-sys.path.append(str(Path(__file__).parent))
-from x_list_summarizer import XListFetcher, XApiFetcher
-from llm_providers import LLMProvider
+# Keep the legacy `python app/web_ui.py` entry point while using package imports.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+ROOT_DIR = PROJECT_ROOT
 
+from app.x_list_summarizer import XListFetcher, XApiFetcher
+from app.llm_providers import LLMProvider
+from app.config import (
+    atomic_write_json,
+    get_public_config,
+    load_config as load_app_config,
+    save_config as save_app_config,
+)
+from app.security import redact_sensitive_text, sanitize_image_src
+from app.task_runner import DigestTaskRequest, DigestTaskRunner, TaskProgress
+
+
+logger = logging.getLogger(__name__)
 
 def _build_fetcher(config, list_owner=None):
     """Factory: returns the configured fetcher (twikit cookies or X API Bearer)."""
@@ -24,14 +42,21 @@ def _build_fetcher(config, list_owner=None):
     method = tw.get('fetch_method', 'twikit')
     if method == 'api':
         return XApiFetcher(bearer_token=tw.get('api_bearer_token', ''), list_owner=list_owner)
-    return XListFetcher(list_owner=list_owner)
+    return XListFetcher(cookies_path=COOKIES_PATH, list_owner=list_owner)
 
 PORT = 8765
-CONFIG_PATH = Path('config.json')
-COOKIES_PATH = Path('browser_session/cookies.json')
-OUTPUT_DIR = Path('output')
+HOST = '127.0.0.1'
+CONFIG_PATH = ROOT_DIR / 'config.json'
+COOKIES_PATH = ROOT_DIR / 'browser_session' / 'cookies.json'
+OUTPUT_DIR = ROOT_DIR / 'output'
+STATIC_FILES = {
+    '/icon.png': ROOT_DIR / 'icon.png',
+    '/screenshots/auth_guide.png': ROOT_DIR / 'screenshots' / 'auth_guide.png',
+}
 
 class DashHandler(http.server.SimpleHTTPRequestHandler):
+    _run_lock = threading.Lock()
+
     def __init__(self, *args, **kwargs):
         self.app_state = kwargs.pop('app_state', {})
         super().__init__(*args, **kwargs)
@@ -40,11 +65,153 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         # Suppress terminal spam
         return
 
-    def send_json(self, data):
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
+    def _send_security_headers(self, *, report=False):
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Frame-Options', 'SAMEORIGIN')
+        if report:
+            policy = (
+                "default-src 'none'; "
+                "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; "
+                "style-src 'unsafe-inline' https://fonts.googleapis.com; "
+                "font-src https://fonts.gstatic.com; "
+                "img-src data: https:; media-src https:; "
+                "frame-src https://www.youtube.com; "
+                "script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+            )
+        else:
+            policy = (
+                "default-src 'self'; "
+                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                "font-src https://fonts.gstatic.com; "
+                "img-src 'self' data: https:; media-src https:; "
+                "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                "frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+            )
+        self.send_header('Content-Security-Policy', policy)
+
+    def _is_trusted_local_request(self):
+        """Restrict the local control API to localhost browser requests."""
+        local_hosts = {'localhost', '127.0.0.1', '::1'}
+
+        def is_same_local_service(value):
+            try:
+                parsed_value = urlparse(value)
+                if parsed_value.scheme != 'http' or parsed_value.hostname != hostname:
+                    return False
+                default_port = 443 if parsed_value.scheme == 'https' else 80
+                return (parsed_value.port or default_port) == self.server.server_port
+            except ValueError:
+                return False
+
+        host_header = self.headers.get('Host', '')
+        try:
+            hostname = urlparse(f'//{host_header}').hostname
+        except ValueError:
+            return False
+        if hostname not in local_hosts:
+            return False
+
+        origin = self.headers.get('Origin')
+        if origin and not is_same_local_service(origin):
+            return False
+        referer = self.headers.get('Referer')
+        if referer and not is_same_local_service(referer):
+            return False
+        fetch_site = self.headers.get('Sec-Fetch-Site')
+        if fetch_site and fetch_site.lower() not in {'same-origin', 'same-site', 'none'}:
+            return False
+        return True
+
+    def send_json(self, data, status=200):
+        payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Cache-Control', 'no-store')
+        self._send_security_headers()
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(payload)
+
+    def _send_static_asset(self, path, *, head_only=False):
+        file_path = STATIC_FILES.get(path)
+        if not file_path or not file_path.is_file():
+            self.send_error(404)
+            return
+        payload = file_path.read_bytes()
+        content_type = mimetypes.guess_type(file_path.name)[0] or 'application/octet-stream'
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Cache-Control', 'public, max-age=3600')
+        self._send_security_headers()
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(payload)
+
+    def _read_json_body(self, max_bytes=1_000_000):
+        """Read a bounded JSON object from the current request."""
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError as exc:
+            raise ValueError('Invalid Content-Length') from exc
+        if length < 0 or length > max_bytes:
+            raise ValueError('Request body is too large')
+        if length == 0:
+            return {}
+        try:
+            data = json.loads(self.rfile.read(length).decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError('Invalid JSON request body') from exc
+        if not isinstance(data, dict):
+            raise ValueError('JSON request body must be an object')
+        return data
+
+    def _load_cookie_credentials(self):
+        """Return valid saved X cookies, without exposing their values."""
+        try:
+            data = json.loads(COOKIES_PATH.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if not all(
+            isinstance(data.get(key), str) and data[key].strip()
+            for key in ('auth_token', 'ct0')
+        ):
+            return None
+        return data
+
+    def _resolve_report_path(self, filename):
+        """Resolve a generated report without following an escaping symlink."""
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+\.html', filename or ''):
+            return None
+        candidate = OUTPUT_DIR / filename
+        try:
+            if candidate.is_symlink():
+                return None
+            output_root = OUTPUT_DIR.resolve()
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(output_root)
+            if not resolved.is_file():
+                return None
+            return resolved
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _list_report_paths(self):
+        """Return safe generated reports, newest first."""
+        reports = []
+        if not OUTPUT_DIR.exists():
+            return reports
+        for candidate in OUTPUT_DIR.glob('summary_*.html'):
+            resolved = self._resolve_report_path(candidate.name)
+            if resolved is not None:
+                reports.append(resolved)
+        try:
+            return sorted(reports, key=lambda item: item.stat().st_mtime, reverse=True)
+        except OSError:
+            return []
 
     def _send_root(self):
         html = self.get_reconstructed_html().encode('utf-8')
@@ -53,6 +220,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Length', str(len(html)))
         self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
         self.send_header('Pragma', 'no-cache')
+        self._send_security_headers()
         self.end_headers()
         return html
 
@@ -60,15 +228,25 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == '/':
             self._send_root()
+        elif parsed.path in STATIC_FILES:
+            self._send_static_asset(parsed.path, head_only=True)
         else:
-            super().do_HEAD()
+            self.send_error(404)
 
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        if parsed.path.startswith('/api/') and not self._is_trusted_local_request():
+            self.send_json({'success': False, 'error': 'Local request required'}, status=403)
+            return
         
         if parsed.path == '/':
             html = self._send_root()
             self.wfile.write(html)
+            return
+
+        elif parsed.path in STATIC_FILES:
+            self._send_static_asset(parsed.path)
             return
             
         elif parsed.path == '/api/status':
@@ -88,7 +266,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 cfg = self.load_config()
                 method = cfg.get('twitter', {}).get('fetch_method', 'twikit')
                 has_creds = (method == 'api' and cfg.get('twitter', {}).get('api_bearer_token')) or \
-                            (method == 'twikit' and COOKIES_PATH.exists())
+                            (method == 'twikit' and self._load_cookie_credentials() is not None)
                 if has_creds:
                     try:
                         fetcher = _build_fetcher(cfg)
@@ -96,7 +274,9 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                         success, msg = loop.run_until_complete(fetcher.verify_session(retries=2))
                         x_status = {'active': success, 'message': msg}
                         loop.close()
-                    except Exception as e: x_status = {'active': False, 'message': 'Auth Error'}
+                    except Exception as exc:
+                        logger.warning("X health check failed (%s)", type(exc).__name__)
+                        x_status = {'active': False, 'message': 'Auth Error'}
                 elif method == 'api':
                     x_status = {'active': False, 'message': 'No Bearer Token'}
                 DashHandler._x_cache = x_status
@@ -118,11 +298,14 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                     ai_status = provider.verify()
                     DashHandler._ai_cache = ai_status
                     DashHandler._ai_cache_time = now
-                except: ai_status = {'active': False, 'message': 'Error'}
+                except Exception as exc:
+                    logger.warning("AI health check failed (%s)", type(exc).__name__)
+                    ai_status = {'active': False, 'message': 'Error'}
             else: ai_status = DashHandler._ai_cache
 
             self.send_json({
                 'running': self.app_state.get('running', False),
+                'run_id': self.app_state.get('run_id'),
                 'status_msg': self.app_state.get('status_msg', 'Ready'),
                 'progress': self.app_state.get('progress', 0),
                 'error': self.app_state.get('error'),
@@ -133,7 +316,11 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             })
 
         elif parsed.path == '/api/config':
-            self.send_json(self.load_config())
+            public_config = get_public_config(self.load_config())
+            public_config.setdefault('twitter', {})['cookies_configured'] = (
+                self._load_cookie_credentials() is not None
+            )
+            self.send_json(public_config)
 
         elif parsed.path == '/api/history':
             history = []
@@ -141,22 +328,39 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             meta_path = OUTPUT_DIR / 'history.json'
             if meta_path.exists():
                 try:
-                    with open(meta_path, 'r') as f: metadata = json.load(f)
-                except: pass
+                    with open(meta_path, 'r', encoding='utf-8') as f:
+                        loaded_metadata = json.load(f)
+                    if isinstance(loaded_metadata, dict):
+                        metadata = loaded_metadata
+                    else:
+                        logger.warning("History metadata is not an object; using report files only")
+                except (OSError, json.JSONDecodeError, TypeError):
+                    logger.warning("History metadata is unreadable; using report files only")
 
             if OUTPUT_DIR.exists():
-                files = sorted(OUTPUT_DIR.glob('summary_*.html'), key=os.path.getmtime, reverse=True)
-                for f in files:
+                for f in self._list_report_paths():
                     file_meta = metadata.get(f.name, {})
+                    if not isinstance(file_meta, dict):
+                        file_meta = {}
+                    report_path = self._resolve_report_path(f.name)
+                    if report_path is None:
+                        continue
+                    try:
+                        report_stat = report_path.stat()
+                    except OSError:
+                        continue
+                    fallback_profile = 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png'
                     history.append({
                         'filename': f.name,
-                        'date': datetime.fromtimestamp(f.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
-                        'size': f.stat().st_size,
+                        'date': datetime.fromtimestamp(report_stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                        'size': report_stat.st_size,
                         'name': file_meta.get('name', 'Analysis Report'),
                         'username': file_meta.get('username', 'Unknown'),
                         'tweets': file_meta.get('tweets', 0),
                         'links': file_meta.get('links', 0),
-                        'profile_img': file_meta.get('profile_img', 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png'),
+                        'profile_img': sanitize_image_src(
+                            file_meta.get('profile_img'), fallback=fallback_profile
+                        ),
                         'members': file_meta.get('members', 0)
                     })
             self.send_json(history)
@@ -164,41 +368,34 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         elif parsed.path.startswith('/output/'):
             filename = parsed.path.split('/')[-1]
             if filename == 'latest':
-                files = sorted(OUTPUT_DIR.glob('summary_*.html'), key=os.path.getmtime, reverse=True)
-                if files: filename = files[0].name
-                else: self.send_error(404); return
-                
-            file_path = OUTPUT_DIR / filename
-            if file_path.exists():
+                files = self._list_report_paths()
+                filename = next(
+                    (item.name for item in files),
+                    None,
+                )
+                if filename is None:
+                    self.send_error(404)
+                    return
+
+            file_path = self._resolve_report_path(filename)
+            if file_path is not None:
+                try:
+                    payload = file_path.read_bytes()
+                except OSError:
+                    self.send_error(404)
+                    return
                 self.send_response(200)
-                self.send_header('Content-type', 'text/html')
+                self.send_header('Content-type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(payload)))
+                self.send_header('Cache-Control', 'no-store')
+                self._send_security_headers(report=True)
                 self.end_headers()
-                with open(file_path, 'rb') as f:
-                    self.wfile.write(f.read())
+                self.wfile.write(payload)
             else:
                 self.send_error(404)
         
-        elif parsed.path == '/api/open-folder':
-            try:
-                import subprocess
-                out_abs = str(OUTPUT_DIR.absolute())
-                if sys.platform == 'win32':
-                    subprocess.run(['explorer', out_abs])
-                else:
-                    cmd = ['open', out_abs] if sys.platform == 'darwin' else ['xdg-open', out_abs]
-                    subprocess.run(cmd)
-                self.send_json({'success': True})
-            except Exception as e:
-                self.send_json({'success': False, 'error': str(e)})
-
-        elif parsed.path == '/api/reset-progress':
-            self.app_state['progress'] = 0
-            self.app_state['status_msg'] = 'Ready'
-            self.app_state['last_report'] = None
-            self.send_json({'success': True})
-
         else:
-            super().do_GET()
+            self.send_error(404)
 
     def _analyze_word_frequencies(self, memberships):
         import re
@@ -227,15 +424,54 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        
+
+        if not self._is_trusted_local_request():
+            self.send_json({'success': False, 'error': 'Local request required'}, status=403)
+            return
+
+        content_type = self.headers.get('Content-Type', '').partition(';')[0].strip().lower()
+        if content_type != 'application/json':
+            self.send_json(
+                {'success': False, 'error': 'Content-Type must be application/json'},
+                status=415,
+            )
+            return
+
+        try:
+            data = self._read_json_body()
+        except ValueError as exc:
+            self.send_json({'success': False, 'error': str(exc)}, status=400)
+            return
+
+        if parsed.path == '/api/open-folder':
+            try:
+                out_abs = str(OUTPUT_DIR.absolute())
+                if sys.platform == 'win32':
+                    subprocess.run(['explorer', out_abs], check=False)
+                else:
+                    cmd = ['open', out_abs] if sys.platform == 'darwin' else ['xdg-open', out_abs]
+                    subprocess.run(cmd, check=False)
+                self.send_json({'success': True})
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning("Could not open output directory (%s)", type(exc).__name__)
+                self.send_json({'success': False, 'error': 'Output directory could not be opened'}, status=500)
+            return
+
+        if parsed.path == '/api/reset-progress':
+            self.app_state['progress'] = 0
+            self.app_state['status_msg'] = 'Ready'
+            self.app_state['last_report'] = None
+            self.send_json({'success': True})
+            return
+
         if parsed.path == '/api/profile':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            params = json.loads(post_data)
-            username = params.get('username', '').strip().replace('@', '')
+            username = str(data.get('username', '')).strip().replace('@', '')
             
             if not username:
                 self.send_json({'success': False, 'error': 'Username required'})
+                return
+            if not re.fullmatch(r'[A-Za-z0-9_]{1,15}', username):
+                self.send_json({'success': False, 'error': 'Invalid X username'}, status=400)
                 return
             
             try:
@@ -251,187 +487,172 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                     'word_counts': word_counts,
                     'memberships': memberships
                 })
-            except Exception as e:
-                self.send_json({'success': False, 'error': str(e)})
+            except Exception as exc:
+                logger.warning("Profile analysis failed (%s)", type(exc).__name__)
+                self.send_json({'success': False, 'error': 'Profile analysis failed'}, status=502)
             return
-            
-        length = int(self.headers.get('Content-Length', 0))
-        data = {}
-        if length > 0:
-            data = json.loads(self.rfile.read(length).decode())
         
         if parsed.path == '/api/save-config':
-            self.save_config(data)
-            if hasattr(DashHandler, '_ai_cache_time'): DashHandler._ai_cache_time = 0
-            self.send_json({'success': True})
+            try:
+                self.save_config(data)
+                if hasattr(DashHandler, '_ai_cache_time'): DashHandler._ai_cache_time = 0
+                if hasattr(DashHandler, '_x_cache_time'): DashHandler._x_cache_time = 0
+                self.send_json({'success': True})
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning("Configuration update failed (%s)", type(exc).__name__)
+                self.send_json({'success': False, 'error': 'Configuration could not be saved'}, status=400)
         elif parsed.path == '/api/save-cookies':
-            COOKIES_PATH.parent.mkdir(exist_ok=True)
-            with open(COOKIES_PATH, 'w') as f: json.dump(data, f)
-            if hasattr(DashHandler, '_x_cache_time'): DashHandler._x_cache_time = 0
-            self.send_json({'success': True})
+            try:
+                if data.get('clear') is True:
+                    COOKIES_PATH.unlink(missing_ok=True)
+                else:
+                    existing = self._load_cookie_credentials() or {}
+                    for key in ('auth_token', 'ct0'):
+                        value = data.get(key)
+                        if isinstance(value, str) and value.strip():
+                            existing[key] = value
+                    if not all(existing.get(key) for key in ('auth_token', 'ct0')):
+                        self.send_json(
+                            {
+                                'success': False,
+                                'error': 'Both auth_token and ct0 are required to replace invalid cookies',
+                            },
+                            status=400,
+                        )
+                        return
+                    atomic_write_json(COOKIES_PATH, existing)
+                if hasattr(DashHandler, '_x_cache_time'): DashHandler._x_cache_time = 0
+                self.send_json({'success': True})
+            except OSError as exc:
+                logger.warning("Cookie update failed (%s)", type(exc).__name__)
+                self.send_json({'success': False, 'error': 'Authentication could not be saved'}, status=500)
         elif parsed.path == '/api/run':
-            if not self.app_state.get('running'):
-                self.app_state.update({'running': True, 'progress': 0, 'status_msg': 'Starting...', 'error': None, 'last_report': None})
-                threading.Thread(target=self.run_task).start()
+            with self._run_lock:
+                if self.app_state.get('running'):
+                    should_start = False
+                else:
+                    should_start = True
+                    self.app_state.update({
+                        'running': True,
+                        'run_id': None,
+                        'progress': 0,
+                        'status_msg': 'Starting...',
+                        'error': None,
+                        'last_report': None,
+                    })
+            if should_start:
+                threading.Thread(target=self.run_task, daemon=True).start()
                 self.send_json({'success': True})
             else:
-                self.send_json({'success': False, 'error': 'Already running'})
+                self.send_json({'success': False, 'error': 'Already running'}, status=409)
         else:
             self.send_error(404)
 
     def load_config(self):
-        if CONFIG_PATH.exists():
-            with open(CONFIG_PATH, 'r') as f: return json.load(f)
-        return {
-            "summarization": {"provider": "groq", "options": {
-                "ollama": {"model": "qwen2.5:7b", "endpoint": "http://localhost:11434"},
-                "lmstudio": {"model": "local-model", "endpoint": "http://localhost:1234/v1"},
-                "groq": {"model": "llama-3.3-70b-versatile", "endpoint": "https://api.groq.com/openai/v1", "api_key": ""},
-                "claude": {"model": "claude-3-5-sonnet-20240620", "api_key": ""},
-                "openai": {"model": "gpt-4o", "api_key": ""}
-            }},
-            "twitter": {"list_urls": [], "max_tweets": 100, "list_owner": None,
-                        "fetch_method": "twikit", "api_bearer_token": ""}
-        }
+        return load_app_config(CONFIG_PATH)
 
     def save_config(self, config):
-        with open(CONFIG_PATH, 'w') as f: json.dump(config, f, indent=2)
+        current = load_app_config(CONFIG_PATH)
+        save_app_config(config, CONFIG_PATH, current=current)
 
     def save_history_metadata(self, filename, meta):
         meta_path = OUTPUT_DIR / 'history.json'
         data = {}
         if meta_path.exists():
             try:
-                with open(meta_path, 'r') as f: data = json.load(f)
-            except: pass
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, json.JSONDecodeError, TypeError):
+                logger.warning("History metadata could not be read; rebuilding from reports")
         
         data[filename] = meta
         
         # Clean up stale entries (if file doesn't exist)
         cleaned = {}
         for fname, info in data.items():
-            if (OUTPUT_DIR / fname).exists():
+            if self._resolve_report_path(fname) is not None and isinstance(info, dict):
                 cleaned[fname] = info
         
-        with open(meta_path, 'w') as f: json.dump(cleaned, f, indent=2)
+        atomic_write_json(meta_path, cleaned)
 
     async def _run_async_task(self):
-        start_time = time.time()
+        """Delegate the digest workflow to the injectable task runner."""
+        secrets = []
         try:
             config = self.load_config()
-            print(f"🚀 [Performance] starting task at {datetime.now().strftime('%H:%M:%S')}")
-            
-            self.app_state.update({'status_msg': 'Initializing...', 'progress': 5, 'error': None})
-            list_owner = config['twitter'].get('list_owner')
-            fetcher = _build_fetcher(config, list_owner=list_owner)
-            
-            t0 = time.time()
-            success, msg = await fetcher.login()
-            print(f"🔑 [Performance] login took {time.time()-t0:.2f}s: {msg}")
-            if not success:
-                is_api = config.get('twitter', {}).get('fetch_method') == 'api'
-                if is_api:
-                    if '401' in msg or 'unauthorized' in msg.lower() or 'invalid' in msg.lower():
-                        raise Exception("X API Bearer Token is invalid. Please update it in Settings → X Authentication.")
-                    elif 'no bearer' in msg.lower():
-                        raise Exception("No X API Bearer Token configured. Please add one in Settings → X Authentication.")
-                    elif '429' in msg or 'rate limit' in msg.lower():
-                        raise Exception("X API rate limit reached. Please wait and try again.")
-                    else:
-                        raise Exception(f"X API login failed: {msg}")
-                else:
-                    if 'not found' in msg.lower() or 'no cookies' in msg.lower():
-                        raise Exception("No X session found. Please go to Settings → X Account and import your cookies first.")
-                    elif '401' in msg or 'unauthorized' in msg.lower() or 'expired' in msg.lower():
-                        raise Exception("X session expired or unauthorized. Please go to Settings → X Account and re-import your cookies.")
-                    elif '429' in msg or 'rate limit' in msg.lower():
-                        raise Exception("X Rate Limit reached while verifying session. Please wait 15 minutes and try again.")
-                    else:
-                        raise Exception(f"X login failed: {msg}. Please go to Settings → X Account and re-import your cookies.")
+            twitter_config = config.get('twitter', {})
+            summary_config = config.get('summarization', {})
+            for option in summary_config.get('options', {}).values():
+                if isinstance(option, dict) and option.get('api_key'):
+                    secrets.append(option['api_key'])
+            if twitter_config.get('api_bearer_token'):
+                secrets.append(twitter_config['api_bearer_token'])
+            if COOKIES_PATH.exists():
+                try:
+                    cookie_data = json.loads(COOKIES_PATH.read_text(encoding='utf-8'))
+                    if isinstance(cookie_data, dict):
+                        secrets.extend(
+                            value for value in cookie_data.values()
+                            if isinstance(value, str) and value
+                        )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    logger.warning("Cookie secrets could not be loaded for error redaction")
 
-            urls = config['twitter'].get('list_urls', [])
-            if not urls:
-                raise Exception("No X List URLs configured. Please go to Settings and add at least one X List URL.")
-            max_t = config['twitter'].get('max_tweets', 100)
-            
-            all_tweets = []
-            async def fetch_and_update(url, i):
-                return await fetcher.fetch_list_tweets(url, max_t)
+            fetcher = _build_fetcher(config, list_owner=twitter_config.get('list_owner'))
+            summary_provider = LLMProvider(config)
+            provider_name = str(summary_config.get('provider', ''))
+            model = summary_config.get('options', {}).get(provider_name, {}).get('model', '')
+            ai_label = f"{provider_name.capitalize()} · {model}" if model else provider_name.capitalize()
 
-            self.app_state['status_msg'] = f"Fetching {len(urls)} lists (staggered)..."
-            print(f"📥 [Performance] fetching {len(urls)} lists with randomization...")
-            t1 = time.time()
-            
-            import random
-            tasks = []
-            for i, url in enumerate(urls):
-                # Stagger the start of each fetch by 0.3s to 1.2s
-                delay = i * (0.3 + random.random() * 0.5)
-                tasks.append(fetcher.fetch_list_tweets(url, max_t, delay=delay))
-                
-            results = await asyncio.gather(*tasks)
-            for r in results: all_tweets.extend(r)
-            print(f"📥 [Performance] fetching took {time.time()-t1:.2f}s ({len(all_tweets)} tweets total)")
+            def update_progress(event: TaskProgress):
+                self.app_state.update({
+                    'run_id': event.run_id,
+                    'status_msg': event.message,
+                    'progress': event.percent,
+                    'error': None,
+                })
 
-            if not all_tweets:
-                raise Exception("No tweets were fetched from any of your lists. Your X session may have expired — please go to Settings → X Account and re-import your cookies.")
-            
-            self.app_state['progress'] = 60
-            self.app_state['status_msg'] = "Analyzing links..."
-            t2 = time.time()
-            agg = fetcher.aggregate_by_links(all_tweets)
-            print(f"📊 [Performance] aggregation took {time.time()-t2:.2f}s")
-            
-            self.app_state['progress'] = 80
-            self.app_state['status_msg'] = "Generating AI insights..."
-            print(f"🤖 [Performance] calling {config['summarization']['provider']}...")
-            t3 = time.time()
-            provider = LLMProvider(config)
-            summary = provider.summarize(agg)
-            
-            if summary.startswith("Error"):
-                raise Exception(f"AI Synthesis failed: {summary}")
-                
-            print(f"🤖 [Performance] AI summary took {time.time()-t3:.2f}s")
-            
-            fname = f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-            OUTPUT_DIR.mkdir(exist_ok=True)
-            _prov = config['summarization']['provider']
-            _model = config['summarization']['options'].get(_prov, {}).get('model', '')
-            _ai_label = f"{_prov.capitalize()} \u00b7 {_model}" if _model else _prov.capitalize()
-            fetcher.generate_html_report(agg, summary, OUTPUT_DIR / fname, tweet_count=len(all_tweets), ai_model=_ai_label)
-            
-            # Save Metadata for History
-            meta = {
-                'name': fetcher.list_info.get('name', 'Unknown List'),
-                'username': fetcher.list_info.get('owner', 'Unknown'),
-                'tweets': len(all_tweets),
-                'links': len(agg['by_link']),
-                'profile_img': fetcher.list_info.get('profile_image_url') or 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
-                'members': fetcher.list_info.get('member_count', 0)
-            }
-            self.save_history_metadata(fname, meta)
+            list_urls = twitter_config.get('list_urls', [])
+            runner = DigestTaskRunner(
+                fetcher=fetcher,
+                summary_provider=summary_provider,
+                progress_callback=update_progress,
+                sensitive_values=secrets,
+                max_concurrency=max(1, len(list_urls)),
+                fetch_delay_factory=lambda index: index * (0.3 + random.random() * 0.5),
+            )
+            request = DigestTaskRequest.from_values(
+                list_urls,
+                max_tweets=twitter_config.get('max_tweets', 100),
+                output_dir=OUTPUT_DIR,
+                ai_model=ai_label,
+            )
+            result = await runner.run(request)
+            if not result.success:
+                raise RuntimeError(result.error or 'Digest task failed')
 
             self.app_state.update({
+                'run_id': result.run_id,
                 'progress': 100,
-                'status_msg': 'Complete!',
-                'last_report': fname
+                'status_msg': 'Complete with warnings' if result.partial else 'Complete!',
+                'last_report': result.report_path.name if result.report_path else None,
+                'error': None,
             })
-            print(f"✅ [Performance] total run time: {time.time()-start_time:.2f}s")
         except Exception as e:
-            err_msg = str(e)
+            err_msg = redact_sensitive_text(str(e), secrets=secrets)
             # Only rewrite generic low-level rate limit errors that weren't already formatted above
             if ('429' in err_msg or 'rate limit' in err_msg.lower()) and 'Please' not in err_msg:
                 err_msg = "X Rate Limit Reached. Please wait 15 minutes before trying again."
 
-            print(f"❌ [Critical Error] {err_msg}")
+            logger.error("Digest task failed (%s)", type(e).__name__)
             self.app_state.update({
                 'status_msg': 'Error',
                 'progress': 0,
-                'error': err_msg
+                'error': err_msg,
+                'running': False,
             })
-            print(f"❌ [Error] Task failed: {err_msg}")
-            self.app_state.update({'error': err_msg, 'status_msg': 'Error', 'running': False})
         finally:
             self.app_state['running'] = False
 
@@ -939,6 +1160,9 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                     <div id="p_key_con">
                         <label>API Key</label>
                         <input type="password" id="p_key" placeholder="••••••••••••••••••••••••••••••••••••••••••••••••">
+                        <label style="display:flex; gap:8px; align-items:center; font-size:12px; font-weight:600;">
+                            <input type="checkbox" id="p_key_clear" style="width:auto; margin:0;"> Clear the saved API key
+                        </label>
                     </div>
 
                     <button class="run-btn btn-full btn-save" onclick="saveConfig()">
@@ -969,6 +1193,10 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                         <label>ct0</label>
                         <input type="text" id="s_ct0" placeholder="Paste ct0">
 
+                        <label style="display:flex; gap:8px; align-items:center; font-size:12px; font-weight:600;">
+                            <input type="checkbox" id="s_cookies_clear" style="width:auto; margin:0;"> Clear the saved cookies
+                        </label>
+
                         <button class="run-btn btn-full btn-save" style="margin-top: 10px;" onclick="saveCookies()">
                             <span>💾</span> Save Cookies
                         </button>
@@ -994,6 +1222,9 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
                         <label>Bearer Token</label>
                         <input type="password" id="s_bearer" placeholder="Paste your X API Bearer Token">
+                        <label style="display:flex; gap:8px; align-items:center; font-size:12px; font-weight:600;">
+                            <input type="checkbox" id="s_bearer_clear" style="width:auto; margin:0;"> Clear the saved Bearer Token
+                        </label>
                         <span class="hint">Saved together with the other settings via <strong>Save App Configuration</strong>.</span>
 
                         <div class="tip-box" style="margin-top: 20px;">
@@ -1021,7 +1252,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 <span style="color:#ffcc00; font-size: 18px;">📁</span> Storage Location
             </div>
             <p style="font-size: 14px; color: var(--text-dim); margin-top: 15px;">All your generated reports are stored on your local drive at:</p>
-            <div id="storage-path" class="path-display">C:\...</div>
+                    <div id="storage-path" class="path-display">C:\\...</div>
             <button class="run-btn" style="padding: 12px 24px; font-size: 13px;" onclick="openFolder()">
                 🚀 Open Output Folder
             </button>
@@ -1038,11 +1269,57 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
 
     <div id="report" class="container tab-content" style="max-width: 100%; padding: 0;">
-        <iframe id="report-frame" style="width: 100%; height: calc(100vh - 90px); border: none;"></iframe>
+        <iframe id="report-frame" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" style="width: 100%; height: calc(100vh - 90px); border: none;"></iframe>
     </div>
 
     <script>
         let cfg = { summarization: { options: {} }, twitter: { list_urls: [] } };
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[ch]);
+        }
+
+        function safeHttpUrl(value, fallback = '') {
+            try {
+                const parsed = new URL(String(value ?? ''));
+                return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? parsed.href : fallback;
+            } catch (_) {
+                return fallback;
+            }
+        }
+
+        function safeReportFilename(value) {
+            const name = String(value ?? '');
+            return name === 'latest' || /^[A-Za-z0-9_.-]+[.]html$/.test(name) ? name : null;
+        }
+
+        function safeInteger(value) {
+            const parsed = Number.parseInt(value, 10);
+            return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+        }
+
+        async function controlPost(path, payload = {}) {
+            const response = await fetch(path, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (!response.ok || !result.success) {
+                throw new Error(result.error || 'Request failed');
+            }
+            return result;
+        }
+
+        async function openFolder() {
+            try {
+                await controlPost('/api/open-folder');
+            } catch (error) {
+                alert(error.message);
+            }
+        }
         
         // Critical: Ensure functions are available globally before everything else
         window.showTab = function(t) {
@@ -1104,7 +1381,10 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                     statusEl.style.maxWidth = '400px';
                     progressCon.style.display = 'none';
                     runBtn.innerText = '✖ Clear';
-                    runBtn.onclick = () => { fetch('/api/reset-progress'); location.reload(); };
+                    runBtn.onclick = async () => {
+                        await controlPost('/api/reset-progress');
+                        location.reload();
+                    };
                     runBtn.style.filter = 'none';
                     runBtn.disabled = false;
                 } else if (s.running) {
@@ -1126,7 +1406,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                     runBtn.onclick = startAnalysis;
                     
                     // Reset progress after delay
-                    setTimeout(() => { fetch('/api/reset-progress'); }, 3000);
+                    setTimeout(() => { controlPost('/api/reset-progress').catch(console.error); }, 3000);
                 } else {
                     statusEl.innerText = 'Ready';
                     statusEl.style.color = 'var(--text-dim)';
@@ -1162,8 +1442,13 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         }
 
         function loadInAppReport(name) {
+            const safeName = safeReportFilename(name);
+            if (!safeName) {
+                console.error('Rejected invalid report filename');
+                return;
+            }
             const frame = document.getElementById('report-frame');
-            frame.src = '/output/' + name;
+            frame.src = '/output/' + encodeURIComponent(safeName);
             showTab('report');
         }
 
@@ -1177,7 +1462,18 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 document.getElementById('s_prov').value = cfg.summarization.provider;
                 document.getElementById('s_owner').value = cfg.twitter.list_owner || '';
                 document.getElementById('s_fetch_method').value = cfg.twitter.fetch_method || 'twikit';
-                document.getElementById('s_bearer').value = cfg.twitter.api_bearer_token || '';
+                const bearer = document.getElementById('s_bearer');
+                bearer.value = '';
+                bearer.placeholder = cfg.twitter.api_bearer_token_configured
+                    ? `Configured (${cfg.twitter.api_bearer_token_mask || 'masked'}) — leave blank to keep`
+                    : 'Paste your X API Bearer Token';
+                document.getElementById('s_bearer_clear').checked = false;
+                const cookieHint = cfg.twitter.cookies_configured
+                    ? 'Configured — leave blank to keep'
+                    : 'Paste value';
+                document.getElementById('s_token').placeholder = `auth_token: ${cookieHint}`;
+                document.getElementById('s_ct0').placeholder = `ct0: ${cookieHint}`;
+                document.getElementById('s_cookies_clear').checked = false;
                 renderFetchMethod();
                 renderProviderOptions();
             } catch(e) { console.error('loadConfig error:', e); }
@@ -1226,7 +1522,14 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 toggleCustomModel();
             }
 
-            if(document.getElementById('p_key')) document.getElementById('p_key').value = data.api_key || '';
+            const keyInput = document.getElementById('p_key');
+            if (keyInput) {
+                keyInput.value = '';
+                keyInput.placeholder = data.api_key_configured
+                    ? `Configured (${data.api_key_mask || 'masked'}) — leave blank to keep`
+                    : 'Paste API key';
+            }
+            document.getElementById('p_key_clear').checked = false;
             const keyCon = document.getElementById('p_key_con');
             if (p === 'ollama' || p === 'lmstudio') {
                 keyCon.style.display = 'none';
@@ -1257,20 +1560,38 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
         async function saveConfig() {
             const p = document.getElementById('s_prov').value;
-            const newCfg = { ...cfg };
+            const newCfg = JSON.parse(JSON.stringify(cfg));
             newCfg.summarization.provider = p;
             newCfg.twitter.list_urls = document.getElementById('s_urls').value.split('\\n').filter(x => x.trim());
-            newCfg.twitter.max_tweets = parseInt(document.getElementById('s_max').value);
+            newCfg.twitter.max_tweets = Math.max(1, safeInteger(document.getElementById('s_max').value) || 100);
             newCfg.twitter.list_owner = document.getElementById('s_owner').value || null;
+            newCfg.summarization.options[p] = newCfg.summarization.options[p] || {};
             
             const sel = document.getElementById('p_mod_select');
             const custom = document.getElementById('p_mod_custom');
             newCfg.summarization.options[p].model = (sel.value === 'custom') ? custom.value : sel.value;
-            
-            newCfg.summarization.options[p].api_key = document.getElementById('p_key').value;
+
+            if (document.getElementById('p_key_clear').checked) {
+                newCfg.summarization.options[p].api_key_clear = true;
+                newCfg.summarization.options[p].api_key = '';
+            } else {
+                newCfg.summarization.options[p].api_key = document.getElementById('p_key').value;
+            }
             newCfg.twitter.fetch_method = document.getElementById('s_fetch_method').value;
-            newCfg.twitter.api_bearer_token = document.getElementById('s_bearer').value;
-            await fetch('/api/save-config', { method: 'POST', body: JSON.stringify(newCfg) });
+            if (document.getElementById('s_bearer_clear').checked) {
+                newCfg.twitter.api_bearer_token_clear = true;
+                newCfg.twitter.api_bearer_token = '';
+            } else {
+                newCfg.twitter.api_bearer_token = document.getElementById('s_bearer').value;
+            }
+            const response = await fetch('/api/save-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(newCfg)
+            });
+            const result = await response.json();
+            if (!response.ok || !result.success) throw new Error(result.error || 'Settings could not be saved');
+            await loadConfig();
             alert('Settings Saved');
         }
 
@@ -1281,8 +1602,21 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         }
 
         async function saveCookies() {
-            const cookies = { auth_token: document.getElementById('s_token').value, ct0: document.getElementById('s_ct0').value };
-            await fetch('/api/save-cookies', { method: 'POST', body: JSON.stringify(cookies) });
+            const cookies = {
+                auth_token: document.getElementById('s_token').value,
+                ct0: document.getElementById('s_ct0').value,
+                clear: document.getElementById('s_cookies_clear').checked
+            };
+            const response = await fetch('/api/save-cookies', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(cookies)
+            });
+            const result = await response.json();
+            if (!response.ok || !result.success) throw new Error(result.error || 'Authentication could not be saved');
+            document.getElementById('s_token').value = '';
+            document.getElementById('s_ct0').value = '';
+            await loadConfig();
             alert('Authentication Updated');
         }
 
@@ -1298,29 +1632,34 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             document.getElementById('report-stats').innerText = `Showing reports 1 - ${Math.min(count, 10)} of ${count}`;
             
             document.getElementById('history-grid').innerHTML = data.map(h => {
+                const filename = safeReportFilename(h.filename);
+                if (!filename || filename === 'latest') return '';
                 const dateObj = new Date(h.date.replace(' ', 'T'));
                 // Format: February 02, 2026 at 21:26:05
                 const formattedDate = dateObj.toLocaleDateString('en-US', { 
                     month: 'long', day: '2-digit', year: 'numeric' 
                 }) + ' at ' + dateObj.toLocaleTimeString('en-US', { hour12: false });
+                const fallbackProfile = 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
+                const profileUrl = safeHttpUrl(h.profile_img, fallbackProfile);
+                const reportUrl = '/output/' + encodeURIComponent(filename);
 
                 return `
                 <div class="report-card">
                     <div class="report-info-con">
-                        <img src="${h.profile_img || 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png'}" class="h-img" onerror="this.src='https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png'">
+                        <img src="${escapeHtml(profileUrl)}" class="h-img" alt="">
                         <div class="report-info">
-                            <span class="r-title">${h.name}</span>
+                            <span class="r-title">${escapeHtml(h.name)}</span>
                             <div style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px; font-weight: 600;">
-                                @${h.username} • ${h.tweets} tweets & ${h.links} links • ${h.members} members
+                                @${escapeHtml(h.username)} • ${safeInteger(h.tweets)} tweets & ${safeInteger(h.links)} links • ${safeInteger(h.members)} members
                             </div>
-                            <span class="r-date">${formattedDate}</span>
+                            <span class="r-date">${escapeHtml(formattedDate)}</span>
                         </div>
                     </div>
                     <div class="report-actions">
-                        <button class="btn-action" onclick="loadInAppReport('${h.filename}')">
+                        <button class="btn-action" onclick="loadInAppReport('${filename}')">
                             Preview <span class="icon-small">👁️</span>
                         </button>
-                        <button class="btn-action" onclick="window.open('/output/${h.filename}', '_blank')">
+                        <button class="btn-action" onclick="window.open('${reportUrl}', '_blank', 'noopener')">
                             External <span class="icon-small">↗️</span>
                         </button>
                     </div>
@@ -1348,6 +1687,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             try {
                 const r = await fetch('/api/profile', {
                     method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username: user })
                 });
                 const d = await r.json();
@@ -1360,7 +1700,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 document.getElementById('prof_res_count').innerText = d.list_count || 0;
                 
                 const xLink = document.getElementById('prof_x_link');
-                xLink.href = `https://x.com/${d.username}/lists/memberships`;
+                xLink.href = `https://x.com/${encodeURIComponent(String(d.username || ''))}/lists/memberships`;
                 xLink.style.display = 'block';
                 
                 // Render Word Cloud
@@ -1407,14 +1747,27 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             el.classList.add('active');
             
             const results = currentMemberships.filter(m => 
-                m.name.toLowerCase().includes(word.toLowerCase())
+                String(m.name || '').toLowerCase().includes(String(word || '').toLowerCase())
             );
             
             const details = document.getElementById('prof_details');
             details.style.display = 'block';
             
+            const rows = results.map(m => {
+                const id = /^[0-9]+$/.test(String(m.id || '')) ? String(m.id) : null;
+                const action = id
+                    ? `<a href="https://x.com/i/lists/${id}" target="_blank" rel="noopener noreferrer" class="btn-action" style="padding: 6px 14px; font-size: 11px; display: inline-flex; text-decoration: none;">VIEW LIST</a>`
+                    : '<span style="color:var(--text-dim)">Unavailable</span>';
+                return `
+                    <tr>
+                        <td style="font-weight:700; color:var(--text)">${escapeHtml(m.name)}</td>
+                        <td style="color:var(--text-dim)">@${escapeHtml(m.owner)}</td>
+                        <td style="text-align:right">${action}</td>
+                    </tr>`;
+            }).join('');
+
             details.innerHTML = `
-                <div class="word-tag"># ${word}</div>
+                <div class="word-tag"># ${escapeHtml(word)}</div>
                 <div style="font-size: 13px; color: var(--text-dim); margin-bottom: 15px; font-weight: 600;">
                     Found in ${results.length} lists:
                 </div>
@@ -1427,19 +1780,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                                 <th style="text-align:right">Action</th>
                             </tr>
                         </thead>
-                        <tbody>
-                            ${results.map(m => `
-                                <tr>
-                                    <td style="font-weight:700; color:var(--text)">${m.name}</td>
-                                    <td style="color:var(--text-dim)">@${m.owner}</td>
-                                    <td style="text-align:right">
-                                        <a href="https://x.com/i/lists/${m.id}" target="_blank" class="btn-action" style="padding: 6px 14px; font-size: 11px; display: inline-flex; text-decoration: none;">
-                                            VIEW LIST
-                                        </a>
-                                    </td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
+                        <tbody>${rows}</tbody>
                     </table>
                 </div>
             `;
@@ -1452,7 +1793,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         async function startAnalysis() {
             reportOpened = false;
             lastKnownReport = null;
-            await fetch('/api/run', { method: 'POST', body: '{}' });
+            await controlPost('/api/run');
         }
 
         function openRankingModal() {
@@ -1567,12 +1908,18 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
 def run_server(app_state):
     handler = lambda *args, **kwargs: DashHandler(*args, app_state=app_state, **kwargs)
-    with ThreadingHTTPServer(("", PORT), handler) as httpd:
-        print(f"🚀 Dashboard running at http://localhost:{PORT}")
-        webbrowser.open(f"http://localhost:{PORT}")
+    with ThreadingHTTPServer((HOST, PORT), handler) as httpd:
+        # Keep the localhost URL shape consumed by the existing Pinokio run.js.
+        print(f"Dashboard running at http://localhost:{PORT}", flush=True)
+        if os.environ.get('XLS_NO_BROWSER') != '1':
+            webbrowser.open(f"http://localhost:{PORT}")
         httpd.serve_forever()
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=os.environ.get('XLS_LOG_LEVEL', 'INFO').upper(),
+        format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    )
     app_state = {'running': False, 'status_msg': '', 'progress': 0, 'error': None, 'last_report': None}
-    Path('logs').mkdir(exist_ok=True)
+    (ROOT_DIR / 'logs').mkdir(exist_ok=True)
     run_server(app_state)

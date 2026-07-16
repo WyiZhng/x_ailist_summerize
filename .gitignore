@@ -3,6 +3,8 @@ ENVIRONMENT
 node_modules/
 venv/
 .env
+.env.*
+!.env.example
 .clinerules
 .cursorrules
 .windsurfrules
@@ -24,6 +26,16 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+tests/.tmp-*/
+tests/.*-tmp/
+tests/.*_tmp/
 
 # Browser session data (contains cookies)
 browser_session/
@@ -31,6 +43,9 @@ cookies.json
 
 # Configuration (contains secrets)
 config.json
+secrets/
+*.pem
+*.key
 
 # Generated reports
 output/
@@ -40,3 +55,6 @@ output/
 
 # Debug files
 debug_*
+
+# Interrupted atomic writes
+*.tmp

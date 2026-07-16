@@ -6,8 +6,17 @@ Supports multiple backends: Ollama, Claude, OpenAI, LM Studio, etc.
 
 import requests
 import time
+import logging
 from anthropic import Anthropic
 from openai import OpenAI
+
+try:
+    from .security import redact_sensitive_text
+except ImportError:  # Compatibility with `python app/web_ui.py`.
+    from security import redact_sensitive_text
+
+
+logger = logging.getLogger(__name__)
 
 class LLMProvider:
     """Abstraction layer for different LLM backends."""
@@ -21,6 +30,16 @@ class LLMProvider:
         """
         self.provider = config['summarization']['provider']
         self.config = config['summarization']['options'][self.provider]
+
+    def _safe_error(self, error):
+        """Return an exception message with configured credentials removed."""
+        return redact_sensitive_text(
+            str(error),
+            secrets=(
+                self.config.get('api_key'),
+                self.config.get('endpoint'),
+            ),
+        )
 
     def _get_effective_config(self):
         """Helper to get resolved endpoint, key and model based on provider."""
@@ -98,7 +117,7 @@ class LLMProvider:
                     if '401' in err or 'api key' in err: return {'active': False, 'message': 'Invalid API Key'}
                     if 'rate_limit' in err or '429' in err: return {'active': False, 'message': 'Rate limited — key is valid, try again shortly'}
                     if '404' in err or 'not found' in err: return {'active': False, 'message': f'Model {model} not found'}
-                    return {'active': False, 'message': f'Connection failed: {str(e)[:50]}...'}
+                    return {'active': False, 'message': f'Connection failed: {self._safe_error(e)[:50]}...'}
 
             elif self.provider == 'claude':
                 if not api_key: return {'active': False, 'message': 'Missing API Key'}
@@ -107,7 +126,7 @@ class LLMProvider:
             return {'active': True, 'message': 'Provider check skipped'}
             
         except Exception as e:
-            return {'active': False, 'message': f"Unexpected Error: {str(e)[:60]}"}
+            return {'active': False, 'message': f"Unexpected Error: {self._safe_error(e)[:60]}"}
 
     def summarize(self, aggregated_data):
         """
@@ -168,15 +187,15 @@ class LLMProvider:
         prompt = "\n".join(prompt_parts)
         
         if len(prompt) > 30000:
-            print(f"⚠️ Prompt too large ({len(prompt)}), truncating...")
+            logger.warning("Prompt too large (%s characters); truncating", len(prompt))
             prompt = prompt[:30000] + "\n\n[TRUNCATED DUE TO SIZE]"
 
         # Groq has tighter per-minute token limits — cap prompt smaller to stay safe
         if getattr(self, 'provider', '') == 'groq' and len(prompt) > 15000:
-            print(f"⚠️ Groq prompt large ({len(prompt)}), trimming to 15K...")
+            logger.warning("Groq prompt is %s characters; trimming to 15K", len(prompt))
             prompt = prompt[:15000] + "\n\n[TRUNCATED FOR GROQ LIMIT]"
             
-        print(f"📝 Prompt built: {len(prompt)} characters")
+        logger.info("Prompt built: %s characters", len(prompt))
         return prompt
     
     def _ollama(self, prompt):
@@ -196,7 +215,7 @@ class LLMProvider:
             response.raise_for_status()
             return response.json()['response']
         except Exception as e:
-            return f"Error with Ollama: {e}\n\nPlease check that Ollama is running and the model '{model}' is installed."
+            return f"Error with Ollama: {self._safe_error(e)}\n\nPlease check that Ollama is running and the model '{model}' is installed."
     
     def _claude(self, prompt):
         """Claude API backend."""
@@ -213,7 +232,7 @@ class LLMProvider:
             )
             return message.content[0].text
         except Exception as e:
-            return f"Error with Claude API: {e}"
+            return f"Error with Claude API: {self._safe_error(e)}"
     
     def _openai(self, prompt):
         """OpenAI API backend."""
@@ -230,7 +249,7 @@ class LLMProvider:
             )
             return response.choices[0].message.content
         except Exception as e:
-            return f"Error with OpenAI API: {e}"
+            return f"Error with OpenAI API: {self._safe_error(e)}"
     
     def _openai_compatible(self, prompt):
         """OpenAI-compatible backends (LM Studio, vLLM, Groq, Gemini, etc.)."""
@@ -261,19 +280,26 @@ class LLMProvider:
                     match = re.search(r'retry.after[^\d]*(\d+)', msg)
                     if match:
                         wait = min(int(match.group(1)) + 2, 60)
-                    print(f"⏳ {self.provider} rate limited (attempt {attempt+1}/{max_attempts}), waiting {wait}s...")
+                    logger.warning(
+                        "%s rate limited (attempt %s/%s); waiting %ss",
+                        self.provider,
+                        attempt + 1,
+                        max_attempts,
+                        wait,
+                    )
                     time.sleep(wait)
                     continue  # retry
 
                 # Final attempt failed or non-retriable error
-                print(f"❌ AI Error ({self.provider}): {msg}")
+                safe_error = self._safe_error(e)
+                logger.error("AI provider %s failed (%s)", self.provider, type(e).__name__)
                 if is_rate_limit:
                     if self.provider == 'gemini':
                         return f"Error with gemini: Rate limited (free tier has low RPM). Wait 1–2 minutes, reduce Max Tweets in Settings, or switch to Groq."
                     return f"Error with {self.provider}: Rate limited after {max_attempts} attempts. Try reducing Max Tweets in Settings, or wait a minute and retry."
                 if 'context_length' in msg or 'maximum context' in msg:
                     return f"Error with {self.provider}: Prompt too large for this model's context window."
-                return f"Error with {self.provider}: {str(e)}\n\nPlease check your settings and connection."
+                return f"Error with {self.provider}: {safe_error}\n\nPlease check your settings and connection."
     
     def _llamacpp(self, prompt):
         """llama.cpp server backend."""
@@ -292,7 +318,7 @@ class LLMProvider:
             response.raise_for_status()
             return response.json()['content']
         except Exception as e:
-            return f"Error with llama.cpp: {e}\n\nPlease check that llama.cpp server is running at {endpoint}"
+            return f"Error with llama.cpp: {self._safe_error(e)}\n\nPlease check the configured llama.cpp server."
     
     def _koboldai(self, prompt):
         """KoboldAI backend."""
@@ -311,7 +337,7 @@ class LLMProvider:
             response.raise_for_status()
             return response.json()['results'][0]['text']
         except Exception as e:
-            return f"Error with KoboldAI: {e}\n\nPlease check that KoboldAI is running at {endpoint}"
+            return f"Error with KoboldAI: {self._safe_error(e)}\n\nPlease check the configured KoboldAI server."
     
     def _textgen_webui(self, prompt):
         """Text Generation WebUI backend."""
@@ -329,4 +355,4 @@ class LLMProvider:
             response.raise_for_status()
             return response.json()['results'][0]['text']
         except Exception as e:
-            return f"Error with Text Generation WebUI: {e}\n\nPlease check that the server is running at {endpoint}"
+            return f"Error with Text Generation WebUI: {self._safe_error(e)}\n\nPlease check the configured server."
