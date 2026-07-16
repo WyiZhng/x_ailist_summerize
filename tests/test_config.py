@@ -59,6 +59,11 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertIn("fetch_method", DEFAULT_CONFIG["twitter"])
         self.assertIn("api_bearer_token", DEFAULT_CONFIG["twitter"])
+        self.assertIs(DEFAULT_CONFIG["twitter"]["incremental_sync"], True)
+        self.assertEqual(DEFAULT_CONFIG["twitter"]["initial_fetch_limit"], 100)
+        self.assertEqual(DEFAULT_CONFIG["twitter"]["page_size"], 100)
+        self.assertEqual(DEFAULT_CONFIG["twitter"]["max_pages"], 20)
+        self.assertEqual(DEFAULT_CONFIG["storage"]["data_dir"], "data")
 
     def test_normalize_deep_merges_old_partial_config_without_mutating_default(self):
         defaults_before = copy.deepcopy(DEFAULT_CONFIG)
@@ -92,7 +97,12 @@ class ConfigTests(unittest.TestCase):
                     "headless_after_auth": "yes",
                     "fetch_method": "scrape-anything",
                     "api_bearer_token": 123,
+                    "incremental_sync": "yes",
+                    "initial_fetch_limit": 0,
+                    "page_size": 500,
+                    "max_pages": -1,
                 },
+                "storage": {"data_dir": ""},
             }
         )
 
@@ -103,6 +113,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIs(result["twitter"]["headless_after_auth"], True)
         self.assertEqual(result["twitter"]["fetch_method"], "twikit")
         self.assertEqual(result["twitter"]["api_bearer_token"], "")
+        self.assertIs(result["twitter"]["incremental_sync"], True)
+        self.assertEqual(result["twitter"]["initial_fetch_limit"], 100)
+        self.assertEqual(result["twitter"]["page_size"], 100)
+        self.assertEqual(result["twitter"]["max_pages"], 20)
+        self.assertEqual(result["storage"]["data_dir"], "data")
 
     def test_load_corrupt_json_falls_back_without_touching_original(self):
         with workspace_temp_directory() as directory:

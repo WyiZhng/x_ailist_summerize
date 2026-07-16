@@ -24,6 +24,7 @@ try:
         sanitize_external_url,
         sanitize_image_src,
     )
+    from .x_api_provider import OfficialXApiProvider
 except ImportError:  # Compatibility with `python app/web_ui.py`.
     from security import (
         escape_html_text,
@@ -34,6 +35,7 @@ except ImportError:  # Compatibility with `python app/web_ui.py`.
         sanitize_external_url,
         sanitize_image_src,
     )
+    from x_api_provider import OfficialXApiProvider
 
 
 logger = logging.getLogger(__name__)
@@ -1090,6 +1092,36 @@ class XApiFetcher(XListFetcher):
     def __init__(self, bearer_token: str = '', list_owner=None):
         super().__init__(cookies_path='browser_session/cookies.json', list_owner=list_owner)
         self.bearer_token = (bearer_token or '').strip()
+        self._ingestion_provider = (
+            OfficialXApiProvider(self.bearer_token) if self.bearer_token else None
+        )
+
+    async def fetch_page(
+        self,
+        list_id: str,
+        *,
+        pagination_token: str | None = None,
+        max_results: int = 100,
+        page_number: int = 1,
+        run_id: str | None = None,
+    ):
+        """Delegate stage-1 canonical paging while retaining legacy rendering."""
+
+        if self._ingestion_provider is None:
+            raise RuntimeError("No Bearer Token configured for official X API ingestion")
+        return await self._ingestion_provider.fetch_page(
+            list_id,
+            pagination_token=pagination_token,
+            max_results=max_results,
+            page_number=page_number,
+            run_id=run_id,
+        )
+
+    async def close_ingestion_provider(self):
+        """Close the shared stage-1 HTTP client when an owner lifecycle provides it."""
+
+        if self._ingestion_provider is not None:
+            await self._ingestion_provider.aclose()
 
     def _safe_error(self, error):
         """Return an API exception message with the Bearer Token removed."""

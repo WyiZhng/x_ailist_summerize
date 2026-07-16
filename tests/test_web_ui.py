@@ -6,13 +6,22 @@ import unittest
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
 from app import web_ui
 from app.config import atomic_write_json, load_config, normalize_config
-from app.providers import MockReportGenerator, MockSummaryProvider, MockXProvider
+from app.providers import (
+    MockReportGenerator,
+    MockSummaryProvider,
+    MockXIngestionProvider,
+    MockXProvider,
+    build_mock_ingestion_posts,
+)
+from app.models import IngestionRun
+from app.storage import FilePostStore
 
 
 class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
@@ -142,6 +151,8 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("${escapeHtml(h.username)}", page)
         self.assertNotIn(" onerror=", page.lower())
         self.assertNotIn(self.api_key, page)
+        self.assertIn("lastKnownReport = status.last_report || null", page)
+        self.assertIn("statusEl.innerText = s.status_msg || 'Complete!'", page)
 
         report_name = "summary_security.html"
         (web_ui.OUTPUT_DIR / report_name).write_text(
@@ -192,6 +203,80 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(json.loads(raw)["success"])
         self.assertEqual(self.app_state["progress"], 0)
         self.assertIsNone(self.app_state["last_report"])
+
+    def test_starting_a_run_does_not_clear_the_previous_report(self):
+        self.app_state["last_report"] = "summary_previous.html"
+
+        with mock.patch.object(web_ui.DashHandler, "run_task", autospec=True):
+            status, _, raw = self.request("/api/run", data={})
+
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["success"])
+        self.assertEqual(self.app_state["last_report"], "summary_previous.html")
+        self.app_state["running"] = False
+
+    def test_active_running_ingestion_is_not_automatically_resumed(self):
+        store = FilePostStore(self.directory / "active-run-data")
+        post = build_mock_ingestion_posts()["mock://mixed"][0]
+        store.save_posts([post])
+        run = IngestionRun(
+            run_id="active-run",
+            started_at=datetime.now(timezone.utc),
+            status="running",
+            ingestion_owner_id="active-ingestion-owner",
+            ingestion_heartbeat_at=datetime.now(timezone.utc),
+            requested_lists=["mock://mixed"],
+            new_post_count=1,
+            new_post_ids=[post.id],
+        )
+        store.create_run(run)
+
+        self.assertIsNone(web_ui._find_resumable_report_run(store))
+
+        run.status = "failed"
+        run.finished_at = datetime.now(timezone.utc)
+        store.update_run(run)
+        self.assertEqual(web_ui._find_resumable_report_run(store).run_id, run.run_id)
+
+        run.report_status = "generating"
+        run.report_claim_id = "active-report-owner"
+        run.report_claimed_at = datetime.now(timezone.utc)
+        store.update_run(run)
+        self.assertIsNone(web_ui._find_resumable_report_run(store))
+
+        run.report_claimed_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        store.update_run(run)
+        self.assertEqual(web_ui._find_resumable_report_run(store).run_id, run.run_id)
+
+    def test_web_finder_accepts_only_stale_running_ingestion(self):
+        store = FilePostStore(self.directory / "stale-running-data")
+        post = build_mock_ingestion_posts()["mock://mixed"][0]
+        store.save_posts([post])
+        now = datetime.now(timezone.utc)
+        run = IngestionRun(
+            run_id="running-candidate",
+            started_at=now - timedelta(hours=2),
+            status="running",
+            ingestion_owner_id="active-ingestion-owner",
+            ingestion_heartbeat_at=now,
+            requested_lists=["mock://mixed"],
+            new_post_count=1,
+            new_post_ids=[post.id],
+            report_status="not_started",
+        )
+        store.create_run(run)
+
+        self.assertIsNone(web_ui._find_resumable_report_run(store))
+
+        run.ingestion_heartbeat_at = now - timedelta(hours=2)
+        store.update_run(run)
+        selected = web_ui._find_resumable_report_run(store)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.run_id, run.run_id)
+
+        run.report_status = "succeeded"
+        store.update_run(run)
+        self.assertIsNone(web_ui._find_resumable_report_run(store))
 
     def test_invalid_cookies_are_not_reported_configured_or_silently_preserved(self):
         damaged = b'{"auth_token": '
@@ -284,6 +369,117 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<script>window.__mock_xss", report.read_text(encoding="utf-8"))
         history = json.loads((web_ui.OUTPUT_DIR / "history.json").read_text(encoding="utf-8"))
         self.assertIn(report_name, history)
+
+    async def test_incremental_no_new_posts_preserves_previous_report(self):
+        config = load_config(web_ui.CONFIG_PATH)
+        config["twitter"].update(
+            {
+                "list_urls": ["mock://mixed"],
+                "fetch_method": "api",
+                "incremental_sync": True,
+            }
+        )
+        config["storage"]["data_dir"] = str(self.directory / "data")
+        atomic_write_json(web_ui.CONFIG_PATH, config)
+
+        class WebIngestionFetcher(MockXIngestionProvider):
+            def __init__(self):
+                super().__init__()
+                self.report_generator = MockReportGenerator()
+
+            def generate_html_report(self, *args, **kwargs):
+                return self.report_generator.generate_html_report(*args, **kwargs)
+
+        handler = object.__new__(web_ui.DashHandler)
+        handler.app_state = {
+            "running": True,
+            "status_msg": "Starting",
+            "progress": 0,
+            "error": None,
+            "last_report": None,
+        }
+        first_summary = MockSummaryProvider()
+        with (
+            mock.patch.object(web_ui, "_build_fetcher", return_value=WebIngestionFetcher()),
+            mock.patch.object(web_ui, "LLMProvider", return_value=first_summary),
+        ):
+            await handler._run_async_task()
+        first_report = handler.app_state["last_report"]
+        self.assertTrue(first_report)
+        self.assertEqual(len(first_summary.calls), 1)
+
+        handler.app_state["running"] = True
+        second_summary = MockSummaryProvider()
+        with (
+            mock.patch.object(web_ui, "_build_fetcher", return_value=WebIngestionFetcher()),
+            mock.patch.object(web_ui, "LLMProvider", return_value=second_summary),
+        ):
+            await handler._run_async_task()
+
+        self.assertEqual(handler.app_state["status_msg"], "No new posts")
+        self.assertEqual(handler.app_state["last_report"], first_report)
+        self.assertEqual(second_summary.calls, [])
+
+    async def test_web_automatically_resumes_a_failed_report_without_x_fetch(self):
+        config = load_config(web_ui.CONFIG_PATH)
+        config["twitter"].update(
+            {
+                "list_urls": ["mock://mixed"],
+                "fetch_method": "api",
+                "incremental_sync": True,
+            }
+        )
+        config["storage"]["data_dir"] = str(self.directory / "resume-data")
+        atomic_write_json(web_ui.CONFIG_PATH, config)
+
+        class WebFetcher(MockXIngestionProvider):
+            def __init__(self, *, fail_report=False, fail_fetch=False):
+                super().__init__()
+                self.fail_report = fail_report
+                self.fail_fetch = fail_fetch
+                self.report_generator = MockReportGenerator()
+
+            async def fetch_page(self, *args, **kwargs):
+                if self.fail_fetch:
+                    raise AssertionError("resume must not call X")
+                return await super().fetch_page(*args, **kwargs)
+
+            def generate_html_report(self, *args, **kwargs):
+                if self.fail_report:
+                    raise RuntimeError("injected web report failure")
+                return self.report_generator.generate_html_report(*args, **kwargs)
+
+        handler = object.__new__(web_ui.DashHandler)
+        handler.app_state = {
+            "running": True,
+            "status_msg": "Starting",
+            "progress": 0,
+            "error": None,
+            "last_report": None,
+        }
+        with (
+            mock.patch.object(
+                web_ui, "_build_fetcher", return_value=WebFetcher(fail_report=True)
+            ),
+            mock.patch.object(web_ui, "LLMProvider", return_value=MockSummaryProvider()),
+        ):
+            await handler._run_async_task()
+        self.assertIsNotNone(handler.app_state["error"])
+
+        handler.app_state.update({"running": True, "error": None})
+        resumed_summary = MockSummaryProvider()
+        with (
+            mock.patch.object(
+                web_ui, "_build_fetcher", return_value=WebFetcher(fail_fetch=True)
+            ),
+            mock.patch.object(web_ui, "LLMProvider", return_value=resumed_summary),
+        ):
+            await handler._run_async_task()
+
+        self.assertIsNone(handler.app_state["error"])
+        self.assertEqual(handler.app_state["status_msg"], "Complete!")
+        self.assertEqual(len(resumed_summary.calls), 1)
+        self.assertTrue(handler.app_state["last_report"])
 
 
 if __name__ == "__main__":

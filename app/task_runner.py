@@ -19,7 +19,7 @@ import threading
 import uuid
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
@@ -28,6 +28,7 @@ from .providers import (
     AggregatedDigest,
     MockReportGenerator,
     MockSummaryProvider,
+    MockXIngestionProvider,
     MockXProvider,
     ReportGenerator,
     SummaryProvider,
@@ -35,13 +36,25 @@ from .providers import (
     XProvider,
 )
 from .config import atomic_write_json
+from .ingestion import (
+    IncrementalIngestionService,
+    IngestionResult,
+    ingestion_run_is_stale,
+)
+from .models import IngestionRun, XPost, utc_now
 from .security import redact_sensitive_text
+from .storage import (
+    FilePostStore,
+    PostStore,
+    StorageConflictError,
+    StorageOwnershipConflictError,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-TaskStatus = Literal["succeeded", "partial", "failed"]
+TaskStatus = Literal["succeeded", "partial", "failed", "no_new_posts"]
 ProgressCallback = Callable[["TaskProgress"], Any]
 ProviderFactory = Callable[..., Any]
 Aggregator = Callable[[list[Tweet]], AggregatedDigest]
@@ -61,6 +74,35 @@ HISTORY_RESERVED_KEYS = frozenset(
         "generated_at",
     }
 )
+REPORT_CLAIM_LEASE = timedelta(hours=1)
+REPORT_CLAIM_HEARTBEAT_SECONDS = 60.0
+
+
+def _aware_datetime(value: datetime) -> datetime:
+    """Normalize injected clocks without silently persisting a naive value."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.astimezone()
+    return value
+
+
+def report_claim_is_stale(
+    run: IngestionRun,
+    *,
+    now: datetime | None = None,
+    lease: timedelta = REPORT_CLAIM_LEASE,
+) -> bool:
+    """Return whether a durable report claim can be safely reclaimed."""
+
+    if run.report_status != "generating":
+        return False
+    if run.report_claimed_at is None:
+        # Legacy/interrupted claims have no owner lease and cannot make
+        # progress; treating them as stale is the only recoverable behavior.
+        return True
+    current = _aware_datetime(now or utc_now())
+    claimed = _aware_datetime(run.report_claimed_at)
+    return current >= claimed + lease
 
 
 @dataclass(frozen=True)
@@ -73,6 +115,13 @@ class DigestTaskRequest:
     ai_model: str = ""
     report_filename: str | None = None
     history_metadata: Mapping[str, Any] = field(default_factory=dict)
+    incremental: bool = False
+    fetch_only: bool = False
+    data_dir: Path = Path("data")
+    page_size: int = 100
+    max_pages: int = 20
+    initial_fetch_limit: int = 100
+    resume_ingestion_run_id: str | None = None
 
     def __post_init__(self) -> None:
         urls = tuple(str(url).strip() for url in self.list_urls if str(url).strip())
@@ -102,9 +151,23 @@ class DigestTaskRequest:
             json.dumps(metadata, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("history_metadata must be JSON-serializable") from exc
+        if self.fetch_only and self.resume_ingestion_run_id:
+            raise ValueError("fetch_only cannot resume a report run")
+        if self.fetch_only:
+            object.__setattr__(self, "incremental", True)
+        for name, value, maximum in (
+            ("page_size", self.page_size, 100),
+            ("max_pages", self.max_pages, None),
+            ("initial_fetch_limit", self.initial_fetch_limit, None),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            if maximum is not None and value > maximum:
+                raise ValueError(f"{name} must be at most {maximum}")
 
         object.__setattr__(self, "list_urls", urls)
         object.__setattr__(self, "output_dir", Path(self.output_dir))
+        object.__setattr__(self, "data_dir", Path(self.data_dir))
         object.__setattr__(self, "history_metadata", metadata)
 
     @classmethod
@@ -117,6 +180,13 @@ class DigestTaskRequest:
         ai_model: str = "",
         report_filename: str | None = None,
         history_metadata: Mapping[str, Any] | None = None,
+        incremental: bool = False,
+        fetch_only: bool = False,
+        data_dir: str | Path = "data",
+        page_size: int = 100,
+        max_pages: int = 20,
+        initial_fetch_limit: int = 100,
+        resume_ingestion_run_id: str | None = None,
     ) -> "DigestTaskRequest":
         return cls(
             list_urls=tuple(list_urls),
@@ -125,6 +195,13 @@ class DigestTaskRequest:
             ai_model=ai_model,
             report_filename=report_filename,
             history_metadata=history_metadata or {},
+            incremental=incremental,
+            fetch_only=fetch_only,
+            data_dir=Path(data_dir),
+            page_size=page_size,
+            max_pages=max_pages,
+            initial_fetch_limit=initial_fetch_limit,
+            resume_ingestion_run_id=resume_ingestion_run_id,
         )
 
 
@@ -175,10 +252,17 @@ class DigestTaskResult:
     report_path: Path | None = None
     history_path: Path | None = None
     error: str | None = None
+    ingestion_status: str | None = None
+    ingestion_run_id: str | None = None
+    fetched_count: int = 0
+    new_post_count: int = 0
+    duplicate_count: int = 0
+    pagination_count: int = 0
+    list_ingestion_results: tuple[dict[str, Any], ...] = ()
 
     @property
     def success(self) -> bool:
-        return self.status in ("succeeded", "partial")
+        return self.status in ("succeeded", "partial", "no_new_posts")
 
     @property
     def partial(self) -> bool:
@@ -205,6 +289,13 @@ class DigestTaskResult:
             "report_path": str(self.report_path) if self.report_path else None,
             "history_path": str(self.history_path) if self.history_path else None,
             "error": self.error,
+            "ingestion_status": self.ingestion_status,
+            "ingestion_run_id": self.ingestion_run_id,
+            "fetched_count": self.fetched_count,
+            "new_post_count": self.new_post_count,
+            "duplicate_count": self.duplicate_count,
+            "pagination_count": self.pagination_count,
+            "list_ingestion_results": list(self.list_ingestion_results),
         }
         if include_payload:
             value.update(
@@ -308,6 +399,54 @@ def _write_history_atomic(history_path: Path, filename: str, metadata: Mapping[s
         atomic_write_json(history_path, history)
 
 
+def _remove_history_entry_atomic(history_path: Path, filename: str, run_id: str) -> None:
+    """Remove only the history entry published by ``run_id``.
+
+    Report lease fencing can discover a lost claim immediately after the
+    history write.  Matching the durable run identifier prevents the old owner
+    from deleting a replacement entry written by the new owner.
+    """
+
+    if not history_path.is_file():
+        return
+    lock = _history_lock(history_path)
+    with lock:
+        try:
+            loaded = json.loads(history_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if not isinstance(loaded, dict):
+            return
+        current = loaded.get(filename)
+        if not isinstance(current, dict) or str(current.get("run_id") or "") != run_id:
+            return
+        del loaded[filename]
+        atomic_write_json(history_path, loaded)
+
+
+def _publish_report_atomic(staging_path: Path, final_path: Path) -> None:
+    """Publish a claim-scoped report without overwriting another owner.
+
+    Both paths are created in the same output directory.  A hard link is an
+    atomic create-if-absent operation on supported local filesystems, unlike
+    ``os.replace`` which could overwrite a report already published by a newer
+    claim.  Failing closed is safer than a non-atomic copy fallback.
+    """
+
+    try:
+        os.link(staging_path, final_path)
+    except FileExistsError as exc:
+        raise TaskProviderError(
+            f"Refusing to overwrite existing report: {final_path.name}"
+        ) from exc
+    except OSError as exc:
+        raise TaskProviderError("Could not atomically publish the report") from exc
+    try:
+        staging_path.unlink()
+    except OSError:
+        logger.warning("Published report staging file could not be removed")
+
+
 async def _invoke(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Call sync or async injected code without blocking the event loop."""
 
@@ -360,6 +499,8 @@ class DigestTaskRunner:
         run_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex[:8],
         sensitive_values: Sequence[str] = (),
         fetch_delay_factory: FetchDelayFactory | None = None,
+        post_store: PostStore | None = None,
+        ingestion_service: IncrementalIngestionService | None = None,
     ) -> None:
         direct_x = [value is not None for value in (x_provider, fetcher)]
         if sum(direct_x) > 1:
@@ -390,6 +531,8 @@ class DigestTaskRunner:
         self._run_id_factory = run_id_factory
         self._sensitive_values = tuple(value for value in sensitive_values if value)
         self._fetch_delay_factory = fetch_delay_factory
+        self._post_store = post_store
+        self._ingestion_service = ingestion_service
 
     def _safe_error(self, error: Any) -> str:
         """Return a provider error with known credentials redacted."""
@@ -401,8 +544,13 @@ class DigestTaskRunner:
             provider = _factory_value(self._fetcher_factory)
         if provider is None:
             raise TaskProviderError("No X provider/fetcher was supplied")
-        if not callable(getattr(provider, "fetch_list_tweets", None)):
-            raise TaskProviderError("X provider must implement fetch_list_tweets()")
+        if not (
+            callable(getattr(provider, "fetch_list_tweets", None))
+            or callable(getattr(provider, "fetch_page", None))
+        ):
+            raise TaskProviderError(
+                "X provider must implement fetch_list_tweets() or fetch_page()"
+            )
         return provider
 
     def _resolve_summary_provider(self) -> Any:
@@ -438,6 +586,667 @@ class DigestTaskRunner:
             logger.warning("Progress callback failed (%s)", type(self._progress_callback).__name__)
             return
 
+    def _set_ingestion_report_status(
+        self,
+        store: PostStore,
+        run_id: str,
+        status: str,
+        error: str | None = None,
+        *,
+        expected_report_status: str | None = None,
+        expected_report_claim_id: str | None | object = None,
+    ) -> None:
+        """Update report state without changing ingestion success/checkpoints."""
+
+        run = store.get_run(run_id)
+        if run is None:
+            return
+        previous_status = run.report_status
+        previous_claim_id = run.report_claim_id
+        run.report_status = status
+        run.report_error = self._safe_error(error) if error else None
+        if status != "generating":
+            run.report_claim_id = None
+            run.report_claimed_at = None
+        if expected_report_status is None:
+            expected_report_status = previous_status
+            expected_report_claim_id = previous_claim_id
+        store.update_run(
+            run,
+            expected_report_status=expected_report_status,
+            expected_report_claim_id=expected_report_claim_id,
+        )
+
+    def _claim_ingestion_report(self, store: PostStore, run_id: str) -> IngestionRun:
+        run = store.get_run(run_id)
+        if run is None:
+            raise TaskProviderError(f"Ingestion run {run_id!r} was not found")
+        previous = run.report_status
+        if previous == "succeeded":
+            raise TaskProviderError("This ingestion run already has a completed report")
+        if previous == "generating" and not report_claim_is_stale(
+            run, now=_aware_datetime(self._now())
+        ):
+            raise TaskProviderError("This ingestion run report is already being generated")
+        if previous not in {
+            "not_started",
+            "failed",
+            "skipped_fetch_only",
+            "generating",
+        }:
+            raise TaskProviderError(
+                f"Ingestion run report cannot be generated from status {previous!r}"
+            )
+        previous_claim_id = run.report_claim_id
+        run.report_status = "generating"
+        run.report_error = None
+        run.report_claim_id = uuid.uuid4().hex
+        run.report_claimed_at = _aware_datetime(self._now())
+        try:
+            store.update_run(
+                run,
+                expected_report_status=previous,
+                expected_report_claim_id=previous_claim_id,
+            )
+        except StorageConflictError as exc:
+            raise TaskProviderError(
+                "Another process claimed this ingestion report"
+            ) from exc
+        return run
+
+    def _refresh_ingestion_report_claim(
+        self,
+        store: PostStore,
+        run_id: str,
+        claim_id: str,
+    ) -> IngestionRun:
+        """Renew and fence a report lease before publishing side effects."""
+
+        run = store.get_run(run_id)
+        if (
+            run is None
+            or run.report_status != "generating"
+            or run.report_claim_id != claim_id
+        ):
+            raise StorageConflictError("Report claim ownership was lost")
+        run.report_claimed_at = _aware_datetime(self._now())
+        store.update_run(
+            run,
+            expected_report_status="generating",
+            expected_report_claim_id=claim_id,
+        )
+        return run
+
+    async def _run_incremental(self, request: DigestTaskRequest) -> DigestTaskResult:
+        """Run the stage-1 ingestion path, then optionally the legacy digest."""
+
+        started_at = self._now()
+        requested_run_id = request.resume_ingestion_run_id
+        run_id = (
+            str(requested_run_id)
+            if requested_run_id
+            else (str(self._run_id_factory())[:16] or uuid.uuid4().hex[:8])
+        )
+        completed_lists: list[str] = []
+        failures: list[ListFetchFailure] = []
+        all_tweets: list[Tweet] = []
+        aggregated: AggregatedDigest = {}
+        summary = ""
+        report_path: Path | None = None
+        history_path: Path | None = None
+        ingestion_result: IngestionResult | None = None
+        ingestion_run: IngestionRun | None = None
+        list_result_dicts: tuple[dict[str, Any], ...] = ()
+        pagination_count = 0
+        last_percent = 0
+        x_provider: Any | None = None
+        recoverable_interrupted_run = False
+        report_claimed = False
+        report_claim_id: str | None = None
+        report_heartbeat_stop = asyncio.Event()
+        report_heartbeat_task: asyncio.Task[None] | None = None
+        report_staging_path: Path | None = None
+        report_file_created = False
+        history_entry_written = False
+        artifacts_committed = False
+        store: PostStore = self._post_store or FilePostStore(request.data_dir)
+
+        async def report_heartbeat() -> None:
+            while not report_heartbeat_stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        report_heartbeat_stop.wait(),
+                        timeout=REPORT_CLAIM_HEARTBEAT_SECONDS,
+                    )
+                    return
+                except TimeoutError:
+                    pass
+                if report_claim_id is None:
+                    return
+                try:
+                    await asyncio.to_thread(
+                        self._refresh_ingestion_report_claim,
+                        store,
+                        run_id,
+                        report_claim_id,
+                    )
+                except StorageConflictError:
+                    logger.warning("[%s] Report heartbeat lost claim ownership", run_id)
+                    return
+                except Exception:
+                    logger.warning("[%s] Report heartbeat could not be persisted", run_id)
+
+        async def stop_report_heartbeat() -> None:
+            nonlocal report_heartbeat_task
+            report_heartbeat_stop.set()
+            if report_heartbeat_task is None:
+                return
+            report_heartbeat_task.cancel()
+            try:
+                await report_heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            report_heartbeat_task = None
+
+        async def progress(
+            phase: str,
+            percent: int,
+            message: str,
+            *,
+            current_list: str | None = None,
+        ) -> None:
+            nonlocal last_percent
+            last_percent = max(last_percent, min(100, max(0, percent)))
+            await self._emit(
+                TaskProgress(
+                    phase=phase,
+                    percent=last_percent,
+                    message=message,
+                    run_id=run_id,
+                    completed_lists=len(completed_lists) + len(failures),
+                    total_lists=len(request.list_urls),
+                    failed_lists=len(failures),
+                    current_list=current_list,
+                    timestamp=self._now(),
+                )
+            )
+
+        def build_result(status: TaskStatus, *, error: str | None = None) -> DigestTaskResult:
+            run = ingestion_run
+            return DigestTaskResult(
+                status=status,
+                started_at=started_at,
+                finished_at=self._now(),
+                list_urls=request.list_urls,
+                run_id=run_id,
+                completed_lists=tuple(completed_lists),
+                list_failures=tuple(failures),
+                tweet_count=len(all_tweets),
+                link_count=len(aggregated.get("by_link", [])),
+                tweets=all_tweets,
+                aggregated=aggregated,
+                summary=summary,
+                report_path=report_path,
+                history_path=history_path,
+                error=error,
+                ingestion_status=run.status if run else None,
+                ingestion_run_id=run.run_id if run else run_id,
+                fetched_count=run.fetched_count if run else 0,
+                new_post_count=run.new_post_count if run else 0,
+                duplicate_count=run.duplicate_count if run else 0,
+                pagination_count=pagination_count,
+                list_ingestion_results=list_result_dicts,
+            )
+
+        try:
+            await progress("initializing", 0, "Resolving incremental ingestion")
+            if requested_run_id:
+                # The configured fetcher may also own the legacy HTML report
+                # renderer.  Resolve it for rendering, but never call X while
+                # replaying already persisted posts.
+                if self._x_provider is not None or self._fetcher_factory is not None:
+                    x_provider = self._resolve_x_provider()
+                ingestion_run = store.get_run(requested_run_id)
+                if ingestion_run is None:
+                    raise TaskProviderError(
+                        f"Ingestion run {requested_run_id!r} was not found"
+                    )
+                if ingestion_run.status == "running" and ingestion_run_is_stale(
+                    ingestion_run, now=_aware_datetime(self._now())
+                ):
+                    stale_owner = ingestion_run.ingestion_owner_id
+                    stale_heartbeat = ingestion_run.ingestion_heartbeat_at
+                    ingestion_run.status = "failed"
+                    ingestion_run.finished_at = _aware_datetime(self._now())
+                    ingestion_run.ingestion_heartbeat_at = ingestion_run.finished_at
+                    ingestion_run.ingestion_owner_id = None
+                    ingestion_run.errors.append(
+                        {
+                            "kind": "stale_ingestion_recovered",
+                            "message": "Ingestion owner lease expired before finalization",
+                        }
+                    )
+                    try:
+                        store.update_ingestion_run(
+                            ingestion_run,
+                            expected_ingestion_owner_id=stale_owner,
+                            expected_ingestion_heartbeat_at=stale_heartbeat,
+                        )
+                    except StorageOwnershipConflictError as exc:
+                        raise TaskProviderError(
+                            "Ingestion run became active while recovery was attempted"
+                        ) from exc
+                if ingestion_run.report_status == "succeeded":
+                    raise TaskProviderError(
+                        "This ingestion run report is already complete"
+                    )
+                if ingestion_run.report_status == "generating" and not report_claim_is_stale(
+                    ingestion_run, now=_aware_datetime(self._now())
+                ):
+                    raise TaskProviderError(
+                        "This ingestion run report is already in progress"
+                    )
+                completed_statuses = {
+                    "success",
+                    "partial_success",
+                    "no_new_posts",
+                }
+                recoverable_interrupted_run = bool(
+                    ingestion_run.status == "failed"
+                    and ingestion_run.new_post_ids
+                    and (
+                        ingestion_run.report_status in {"not_started", "failed"}
+                        or report_claim_is_stale(
+                            ingestion_run, now=_aware_datetime(self._now())
+                        )
+                    )
+                )
+                if (
+                    ingestion_run.status not in completed_statuses
+                    and not recoverable_interrupted_run
+                ):
+                    raise TaskProviderError("Only a completed ingestion run can be resumed")
+                wanted = set(ingestion_run.new_post_ids)
+                stored_posts = {post.id: post for post in store.read_posts()}
+                missing = wanted.difference(stored_posts)
+                if missing:
+                    raise TaskProviderError(
+                        "Stored ingestion posts are incomplete; refusing report regeneration"
+                    )
+                canonical_posts = [stored_posts[post_id] for post_id in ingestion_run.new_post_ids]
+                completed_lists.extend(ingestion_run.successful_lists)
+                failures.extend(
+                    ListFetchFailure(
+                        list_url=item,
+                        error="Previous ingestion for this List failed",
+                    )
+                    for item in ingestion_run.failed_lists
+                )
+                if recoverable_interrupted_run:
+                    accounted_for = set(ingestion_run.successful_lists).union(
+                        ingestion_run.failed_lists
+                    )
+                    failures.extend(
+                        ListFetchFailure(
+                            list_url=item,
+                            error="Ingestion was interrupted before this List completed",
+                        )
+                        for item in ingestion_run.requested_lists
+                        if item not in accounted_for
+                    )
+                await progress("ingesting", 65, "Loaded persisted posts for report retry")
+            else:
+                x_provider = self._resolve_x_provider()
+                await progress("authenticating", 5, "Checking X provider")
+                login = (
+                    None
+                    if callable(getattr(x_provider, "fetch_page", None))
+                    else getattr(x_provider, "login", None)
+                )
+                if callable(login):
+                    login_result = await _invoke(login)
+                    if not (
+                        isinstance(login_result, tuple)
+                        and len(login_result) >= 2
+                        and bool(login_result[0])
+                    ):
+                        message = (
+                            str(login_result[1])
+                            if isinstance(login_result, tuple) and len(login_result) >= 2
+                            else "X provider login failed"
+                        )
+                        raise TaskProviderError(self._safe_error(message))
+
+                async def ingestion_progress(event: dict[str, Any]) -> None:
+                    pages = int(event.get("page_number", 0) or 0)
+                    percent = min(64, 10 + pages * 3)
+                    await progress(
+                        "ingesting",
+                        percent,
+                        (
+                            f"List {event.get('list_id', '')}: page {pages}, "
+                            f"{event.get('new_count', 0)} new"
+                        ),
+                        current_list=str(event.get("list_id") or "") or None,
+                    )
+
+                service = self._ingestion_service or IncrementalIngestionService(
+                    provider=x_provider,
+                    store=store,
+                    page_size=request.page_size,
+                    max_pages=request.max_pages,
+                    initial_fetch_limit=request.initial_fetch_limit,
+                    progress_callback=ingestion_progress,
+                    sensitive_values=self._sensitive_values,
+                )
+                ingestion_result = await service.ingest(
+                    request.list_urls,
+                    run_id=run_id,
+                    max_tweets=request.max_tweets,
+                )
+                ingestion_run = ingestion_result.run
+                canonical_posts = ingestion_result.new_posts
+                list_result_dicts = tuple(
+                    item.to_dict() for item in ingestion_result.list_results
+                )
+                pagination_count = sum(
+                    item.page_count for item in ingestion_result.list_results
+                )
+                completed_lists.extend(ingestion_run.successful_lists)
+                for item in ingestion_result.list_results:
+                    if not item.success:
+                        failures.append(
+                            ListFetchFailure(
+                                list_url=item.list_id,
+                                error=item.error or item.stop_reason or "Ingestion failed",
+                            )
+                        )
+
+            all_tweets = [post.to_legacy_tweet() for post in canonical_posts]
+            if ingestion_run is None:
+                raise TaskProviderError("Ingestion did not produce a run record")
+            if ingestion_run.status == "failed" and not recoverable_interrupted_run:
+                detail = "; ".join(
+                    f"{item.list_url}: {item.error}" for item in failures
+                ) or "All requested Lists failed"
+                await progress("failed", last_percent, detail)
+                return build_result("failed", error=detail)
+
+            if request.fetch_only:
+                try:
+                    self._set_ingestion_report_status(
+                        store, run_id, "skipped_fetch_only"
+                    )
+                except StorageConflictError:
+                    logger.info(
+                        "[%s] Fetch-only report state was superseded by a report claim",
+                        run_id,
+                    )
+                final_status: TaskStatus
+                if ingestion_run.status == "partial_success":
+                    final_status = "partial"
+                elif ingestion_run.status == "no_new_posts":
+                    final_status = "no_new_posts"
+                else:
+                    final_status = "succeeded"
+                await progress("complete", 100, "Fetch-only ingestion complete")
+                return build_result(final_status)
+
+            if not all_tweets:
+                try:
+                    self._set_ingestion_report_status(
+                        store, run_id, "skipped_no_new_posts"
+                    )
+                except StorageConflictError:
+                    logger.info(
+                        "[%s] No-new-post report state was superseded",
+                        run_id,
+                    )
+                final_status = (
+                    "partial" if ingestion_run.status == "partial_success" else "no_new_posts"
+                )
+                await progress("complete", 100, "No new posts; summary skipped")
+                return build_result(final_status)
+
+            ingestion_run = self._claim_ingestion_report(store, run_id)
+            report_claimed = True
+            report_claim_id = ingestion_run.report_claim_id
+            if report_claim_id is None:
+                raise TaskProviderError("Report claim did not receive an owner identifier")
+            report_heartbeat_task = asyncio.create_task(report_heartbeat())
+
+            await progress("aggregating", 68, f"Aggregating {len(all_tweets)} new post(s)")
+            aggregate = self._aggregator
+            if aggregate is None and x_provider is not None:
+                aggregate = getattr(x_provider, "aggregate_by_links", None)
+            aggregate = aggregate or legacy_aggregate_by_links
+            aggregated_value = await _invoke(aggregate, all_tweets)
+            if not isinstance(aggregated_value, dict):
+                raise TypeError("Aggregator must return a dictionary")
+            aggregated = aggregated_value
+
+            summary_provider = self._resolve_summary_provider()
+            await progress("summarizing", 78, "Generating summary")
+            summary_value = await _invoke(summary_provider.summarize, aggregated)
+            if not isinstance(summary_value, str):
+                raise TaskSummaryError(
+                    f"Summary provider returned {type(summary_value).__name__}, expected str"
+                )
+            summary = summary_value
+            if summary.lstrip().lower().startswith("error"):
+                raise TaskSummaryError(summary)
+
+            report_generator = self._resolve_report_generator(x_provider)
+            request.output_dir.mkdir(parents=True, exist_ok=True)
+            filename = request.report_filename or (
+                f"summary_{self._now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.html"
+            )
+            report_path = request.output_dir / filename
+            if report_path.exists():
+                raise TaskProviderError(f"Refusing to overwrite existing report: {filename}")
+            report_staging_path = request.output_dir / f".report-{report_claim_id}.tmp.html"
+            if report_staging_path.exists():
+                raise TaskProviderError("Report claim staging path already exists")
+            report_method = getattr(report_generator, "generate_html_report", None)
+            if report_method is None and callable(report_generator):
+                report_method = report_generator
+            if not callable(report_method):
+                raise TaskProviderError("Report generator must implement generate_html_report()")
+            self._refresh_ingestion_report_claim(store, run_id, report_claim_id)
+            await progress("reporting", 88, "Generating report")
+            generated_path = await _invoke(
+                report_method,
+                aggregated,
+                summary,
+                report_staging_path,
+                tweet_count=len(all_tweets),
+                ai_model=request.ai_model,
+            )
+            if generated_path:
+                returned_path = Path(generated_path)
+                if returned_path.resolve() != report_staging_path.resolve():
+                    raise TaskProviderError(
+                        "Report generator returned a path different from the requested output"
+                    )
+            if not report_staging_path.exists():
+                raise TaskProviderError(
+                    f"Report generator did not create {report_staging_path.name}"
+                )
+            self._refresh_ingestion_report_claim(store, run_id, report_claim_id)
+            _publish_report_atomic(report_staging_path, report_path)
+            report_file_created = True
+
+            list_info = getattr(x_provider, "list_info", {}) or {}
+            final_status = "partial" if failures else "succeeded"
+            metadata: dict[str, Any] = {
+                "run_id": run_id,
+                "name": list_info.get("name", "X List Summary"),
+                "username": list_info.get("owner", "Unknown"),
+                "tweets": len(all_tweets),
+                "links": len(aggregated.get("by_link", [])),
+                "profile_img": list_info.get("profile_image_url"),
+                "members": list_info.get("member_count", 0),
+                "status": final_status,
+                "completed_lists": list(completed_lists),
+                "failed_lists": [asdict(item) for item in failures],
+                "generated_at": self._now().isoformat(),
+                "ingestion_run_id": run_id,
+            }
+            metadata.update(request.history_metadata)
+            history_path = request.output_dir / "history.json"
+            await progress("history", 96, "Updating report history")
+            _write_history_atomic(history_path, report_path.name, metadata)
+            history_entry_written = True
+            ingestion_run = self._refresh_ingestion_report_claim(
+                store, run_id, report_claim_id
+            )
+            if recoverable_interrupted_run:
+                ingestion_run.status = "partial_success" if failures else "success"
+                ingestion_run.finished_at = self._now().astimezone()
+                for failure in failures:
+                    if failure.list_url not in ingestion_run.failed_lists:
+                        ingestion_run.failed_lists.append(failure.list_url)
+                    if not any(
+                        item.get("list_id") == failure.list_url
+                        for item in ingestion_run.errors
+                    ):
+                        ingestion_run.errors.append(
+                            {
+                                "list_id": failure.list_url,
+                                "kind": "interrupted",
+                                "message": failure.error,
+                            }
+                        )
+                ingestion_run.report_status = "succeeded"
+                ingestion_run.report_error = None
+                ingestion_run.report_claim_id = None
+                ingestion_run.report_claimed_at = None
+                store.update_run(
+                    ingestion_run,
+                    expected_report_status="generating",
+                    expected_report_claim_id=report_claim_id,
+                )
+            else:
+                self._set_ingestion_report_status(
+                    store,
+                    run_id,
+                    "succeeded",
+                    expected_report_status="generating",
+                    expected_report_claim_id=report_claim_id,
+                )
+            report_claimed = False
+            artifacts_committed = True
+            await progress("complete", 100, "Digest complete")
+            logger.info(
+                "[%s] Incremental digest completed status=%s fetched_count=%s "
+                "new_count=%s duplicate_count=%s",
+                run_id,
+                final_status,
+                ingestion_run.fetched_count,
+                ingestion_run.new_post_count,
+                ingestion_run.duplicate_count,
+            )
+            return build_result(final_status)
+        except asyncio.CancelledError:
+            await stop_report_heartbeat()
+            if ingestion_run is not None and report_claimed:
+                try:
+                    self._set_ingestion_report_status(
+                        store,
+                        run_id,
+                        "failed",
+                        "Report generation was cancelled",
+                        expected_report_status="generating",
+                        expected_report_claim_id=report_claim_id,
+                    )
+                except StorageConflictError:
+                    logger.warning(
+                        "[%s] Cancelled report claim was superseded by another process",
+                        run_id,
+                    )
+                except Exception:
+                    logger.error("[%s] Could not persist report cancellation", run_id)
+            if (
+                not artifacts_committed
+                and history_entry_written
+                and history_path is not None
+                and report_path is not None
+            ):
+                try:
+                    await asyncio.to_thread(
+                        _remove_history_entry_atomic,
+                        history_path,
+                        report_path.name,
+                        run_id,
+                    )
+                except Exception:
+                    logger.warning("[%s] Could not remove cancelled history entry", run_id)
+            if not artifacts_committed and report_file_created and report_path is not None:
+                try:
+                    report_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("[%s] Could not remove cancelled report file", run_id)
+            if not artifacts_committed and report_staging_path is not None:
+                try:
+                    report_staging_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("[%s] Could not remove cancelled report staging file", run_id)
+            raise
+        except Exception as exc:
+            await stop_report_heartbeat()
+            safe_error = self._safe_error(exc)
+            if ingestion_run is not None and report_claimed:
+                try:
+                    self._set_ingestion_report_status(
+                        store,
+                        run_id,
+                        "failed",
+                        safe_error,
+                        expected_report_status="generating",
+                        expected_report_claim_id=report_claim_id,
+                    )
+                except StorageConflictError:
+                    logger.warning(
+                        "[%s] Report failure status was superseded by another process",
+                        run_id,
+                    )
+                except Exception:
+                    logger.error("[%s] Could not persist report failure status", run_id)
+            if (
+                not artifacts_committed
+                and history_entry_written
+                and history_path is not None
+                and report_path is not None
+            ):
+                try:
+                    await asyncio.to_thread(
+                        _remove_history_entry_atomic,
+                        history_path,
+                        report_path.name,
+                        run_id,
+                    )
+                except Exception:
+                    logger.warning("[%s] Could not remove failed history entry", run_id)
+            cleanup_path = report_path if report_file_created else None
+            if not artifacts_committed and cleanup_path is not None:
+                try:
+                    cleanup_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("[%s] Could not remove failed report file", run_id)
+            if not artifacts_committed and report_staging_path is not None:
+                try:
+                    report_staging_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("[%s] Could not remove failed report staging file", run_id)
+            if not artifacts_committed:
+                report_path = None
+                history_path = None
+            logger.error("[%s] Incremental digest failed (%s)", run_id, type(exc).__name__)
+            await progress("failed", last_percent, safe_error)
+            return build_result("failed", error=safe_error)
+        finally:
+            await stop_report_heartbeat()
+
     async def run(
         self,
         request: DigestTaskRequest | None = None,
@@ -462,6 +1271,9 @@ class DigestTaskRunner:
                 report_filename=report_filename,
                 history_metadata=history_metadata,
             )
+
+        if request.incremental:
+            return await self._run_incremental(request)
 
         started_at = self._now()
         run_id = str(self._run_id_factory())[:16] or uuid.uuid4().hex[:8]
@@ -707,6 +1519,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tweets", type=int, default=100)
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     parser.add_argument(
+        "--fetch-only",
+        action="store_true",
+        help="persist incremental posts and checkpoints without calling an LLM",
+    )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="use durable incremental ingestion before generating the mock digest",
+    )
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--page-size", type=int, default=100)
+    parser.add_argument("--max-pages", type=int, default=20)
+    parser.add_argument("--initial-fetch-limit", type=int, default=100)
+    parser.add_argument(
+        "--resume-ingestion-run",
+        help="regenerate a report from posts already stored for this ingestion run",
+    )
+    parser.add_argument(
         "--fail-list",
         action="append",
         default=[],
@@ -722,17 +1552,38 @@ async def _mock_main(args: argparse.Namespace) -> DigestTaskResult:
         events.append(event)
         print(f"[{event.percent:3d}%] {event.phase}: {event.message}")
 
+    use_incremental = bool(
+        args.incremental or args.fetch_only or args.resume_ingestion_run
+    )
+    if use_incremental:
+        failures = {
+            (list_id, 1): RuntimeError(f"Mock list failure: {list_id}")
+            for list_id in args.fail_list
+        }
+        x_provider: Any = MockXIngestionProvider(page_failures=failures)
+        store: PostStore | None = FilePostStore(args.data_dir)
+    else:
+        x_provider = MockXProvider(fail_lists=args.fail_list)
+        store = None
     runner = DigestTaskRunner(
-        x_provider=MockXProvider(fail_lists=args.fail_list),
+        x_provider=x_provider,
         summary_provider=MockSummaryProvider(),
         report_generator=MockReportGenerator(),
         progress_callback=show_progress,
+        post_store=store,
     )
     request = DigestTaskRequest.from_values(
         args.lists or ["mock://mixed"],
         max_tweets=args.max_tweets,
         output_dir=args.output_dir,
         ai_model="MockSummaryProvider",
+        incremental=use_incremental,
+        fetch_only=args.fetch_only,
+        data_dir=args.data_dir,
+        page_size=args.page_size,
+        max_pages=args.max_pages,
+        initial_fetch_limit=args.initial_fetch_limit,
+        resume_ingestion_run_id=args.resume_ingestion_run,
     )
     return await runner.run(request)
 
@@ -759,7 +1610,9 @@ __all__ = [
     "DigestTaskResult",
     "DigestTaskRunner",
     "ListFetchFailure",
+    "REPORT_CLAIM_LEASE",
     "TaskProgress",
     "legacy_aggregate_by_links",
     "main",
+    "report_claim_is_stale",
 ]

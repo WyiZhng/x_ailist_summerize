@@ -30,8 +30,15 @@ from app.config import (
     load_config as load_app_config,
     save_config as save_app_config,
 )
+from app.ingestion import ingestion_run_is_stale
 from app.security import redact_sensitive_text, sanitize_image_src
-from app.task_runner import DigestTaskRequest, DigestTaskRunner, TaskProgress
+from app.task_runner import (
+    DigestTaskRequest,
+    DigestTaskRunner,
+    TaskProgress,
+    report_claim_is_stale,
+)
+from app.storage import FilePostStore
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +50,26 @@ def _build_fetcher(config, list_owner=None):
     if method == 'api':
         return XApiFetcher(bearer_token=tw.get('api_bearer_token', ''), list_owner=list_owner)
     return XListFetcher(cookies_path=COOKIES_PATH, list_owner=list_owner)
+
+
+def _find_resumable_report_run(store):
+    """Return the newest durable ingestion run whose report is still pending."""
+
+    posts = {post.id for post in store.read_posts()}
+    candidates = []
+    for run in store.read_runs():
+        resumable_report = run.report_status in {"not_started", "failed"} or (
+            run.report_status == "generating" and report_claim_is_stale(run)
+        )
+        if not run.new_post_ids or not resumable_report:
+            continue
+        if not set(run.new_post_ids).issubset(posts):
+            continue
+        if run.status in {"success", "partial_success", "failed"} or (
+            run.status == "running" and ingestion_run_is_stale(run)
+        ):
+            candidates.append(run)
+    return max(candidates, key=lambda item: item.started_at, default=None)
 
 PORT = 8765
 HOST = '127.0.0.1'
@@ -538,7 +565,6 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                         'progress': 0,
                         'status_msg': 'Starting...',
                         'error': None,
-                        'last_report': None,
                     })
             if should_start:
                 threading.Thread(target=self.run_task, daemon=True).start()
@@ -580,6 +606,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
     async def _run_async_task(self):
         """Delegate the digest workflow to the injectable task runner."""
         secrets = []
+        fetcher = None
         try:
             config = self.load_config()
             twitter_config = config.get('twitter', {})
@@ -615,6 +642,24 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 })
 
             list_urls = twitter_config.get('list_urls', [])
+            incremental = bool(
+                twitter_config.get('fetch_method') == 'api'
+                and twitter_config.get('incremental_sync', True)
+            )
+            configured_data_dir = Path(
+                config.get('storage', {}).get('data_dir', 'data')
+            ).expanduser()
+            data_dir = (
+                configured_data_dir
+                if configured_data_dir.is_absolute()
+                else ROOT_DIR / configured_data_dir
+            )
+            post_store = FilePostStore(data_dir) if incremental else None
+            resumable_run = (
+                _find_resumable_report_run(post_store)
+                if post_store is not None
+                else None
+            )
             runner = DigestTaskRunner(
                 fetcher=fetcher,
                 summary_provider=summary_provider,
@@ -622,24 +667,39 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 sensitive_values=secrets,
                 max_concurrency=max(1, len(list_urls)),
                 fetch_delay_factory=lambda index: index * (0.3 + random.random() * 0.5),
+                post_store=post_store,
             )
             request = DigestTaskRequest.from_values(
-                list_urls,
+                resumable_run.requested_lists if resumable_run is not None else list_urls,
                 max_tweets=twitter_config.get('max_tweets', 100),
                 output_dir=OUTPUT_DIR,
                 ai_model=ai_label,
+                incremental=incremental,
+                data_dir=data_dir,
+                page_size=twitter_config.get('page_size', 100),
+                max_pages=twitter_config.get('max_pages', 20),
+                initial_fetch_limit=twitter_config.get('initial_fetch_limit', 100),
+                resume_ingestion_run_id=(
+                    resumable_run.run_id if resumable_run is not None else None
+                ),
             )
             result = await runner.run(request)
             if not result.success:
                 raise RuntimeError(result.error or 'Digest task failed')
 
-            self.app_state.update({
+            update = {
                 'run_id': result.run_id,
                 'progress': 100,
-                'status_msg': 'Complete with warnings' if result.partial else 'Complete!',
-                'last_report': result.report_path.name if result.report_path else None,
+                'status_msg': (
+                    'No new posts'
+                    if result.status == 'no_new_posts'
+                    else ('Complete with warnings' if result.partial else 'Complete!')
+                ),
                 'error': None,
-            })
+            }
+            if result.report_path:
+                update['last_report'] = result.report_path.name
+            self.app_state.update(update)
         except Exception as e:
             err_msg = redact_sensitive_text(str(e), secrets=secrets)
             # Only rewrite generic low-level rate limit errors that weren't already formatted above
@@ -654,6 +714,12 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 'running': False,
             })
         finally:
+            close_provider = getattr(fetcher, 'close_ingestion_provider', None)
+            if callable(close_provider):
+                try:
+                    await close_provider()
+                except Exception:
+                    logger.warning("Could not close X API ingestion provider")
             self.app_state['running'] = False
 
     def run_task(self):
@@ -1397,7 +1463,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                     runBtn.innerHTML = '<span style="font-size:11px;">▶</span> Run Analysis';
                     runBtn.onclick = null;
                 } else if (s.progress === 100) {
-                    statusEl.innerText = 'Complete!';
+                    statusEl.innerText = s.status_msg || 'Complete!';
                     statusEl.style.color = 'var(--green)';
                     progressCon.style.display = 'none';
                     runBtn.style.filter = 'none';
@@ -1792,7 +1858,17 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
         async function startAnalysis() {
             reportOpened = false;
-            lastKnownReport = null;
+            // Seed the baseline before starting so the preserved previous
+            // report is not mistaken for this run's newly generated report.
+            try {
+                const response = await fetch('/api/status');
+                if (response.ok) {
+                    const status = await response.json();
+                    lastKnownReport = status.last_report || null;
+                }
+            } catch (error) {
+                console.debug('Could not seed report baseline', error);
+            }
             await controlPost('/api/run');
         }
 

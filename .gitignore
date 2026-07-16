@@ -2,6 +2,7 @@
 ENVIRONMENT
 node_modules/
 venv/
+.venv/
 .env
 .env.*
 !.env.example
@@ -49,6 +50,9 @@ secrets/
 
 # Generated reports
 output/
+
+# Private ingestion data
+data/
 
 # Logs
 *.log

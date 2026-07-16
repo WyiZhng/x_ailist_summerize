@@ -1,7 +1,16 @@
 {
+    "storage": {
+        "data_dir": "data"
+    },
     "twitter": {
         "list_urls": [
             "https://x.com/i/lists/YOUR_LIST_ID_HERE"
-        ]
+        ],
+        "fetch_method": "api",
+        "api_bearer_token": "",
+        "incremental_sync": true,
+        "initial_fetch_limit": 100,
+        "page_size": 100,
+        "max_pages": 20
     }
 }

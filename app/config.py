@@ -78,6 +78,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "headless_after_auth": True,
         "fetch_method": "twikit",
         "api_bearer_token": "",
+        "incremental_sync": True,
+        "initial_fetch_limit": 100,
+        "page_size": 100,
+        "max_pages": 20,
+    },
+    "storage": {
+        "data_dir": "data",
     },
 }
 
@@ -196,8 +203,16 @@ def normalize_config(config: Any) -> dict[str, Any]:
         twitter["max_tweets"] = DEFAULT_CONFIG["twitter"]["max_tweets"]
     if twitter["max_scrolls"] < 0:
         twitter["max_scrolls"] = DEFAULT_CONFIG["twitter"]["max_scrolls"]
+    for positive_field in ("initial_fetch_limit", "page_size", "max_pages"):
+        if twitter[positive_field] <= 0:
+            twitter[positive_field] = DEFAULT_CONFIG["twitter"][positive_field]
+    twitter["page_size"] = min(100, twitter["page_size"])
     if twitter["fetch_method"] not in {"twikit", "api"}:
         twitter["fetch_method"] = DEFAULT_CONFIG["twitter"]["fetch_method"]
+
+    storage = normalized["storage"]
+    if not storage["data_dir"].strip():
+        storage["data_dir"] = DEFAULT_CONFIG["storage"]["data_dir"]
 
     return normalized
 

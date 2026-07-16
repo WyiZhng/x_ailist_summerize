@@ -7,17 +7,20 @@ import json
 import shutil
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from app.providers import (
     MockReportGenerator,
     MockSummaryProvider,
+    MockXIngestionProvider,
     MockXProvider,
     ReportGenerator,
     SummaryProvider,
     XProvider,
 )
+from app.storage import InMemoryPostStore
 from app.task_runner import (
     DigestTaskRequest,
     DigestTaskRunner,
@@ -531,6 +534,733 @@ class DigestTaskRunnerTests(unittest.IsolatedAsyncioTestCase):
             links,
         )
 
+    async def test_incremental_posts_enter_existing_summary_report_and_history(self) -> None:
+        store = InMemoryPostStore()
+        summary_provider = MockSummaryProvider()
+        report_generator = MockReportGenerator()
+        runner = DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            summary_provider=summary_provider,
+            report_generator=report_generator,
+            post_store=store,
+        )
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            data_dir=self.output_dir / "data",
+            incremental=True,
+            page_size=2,
+        )
+
+        result = await runner.run(request)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.new_post_count, 5)
+        self.assertEqual(result.tweet_count, 5)
+        self.assertEqual(len(summary_provider.calls), 1)
+        self.assertEqual(len(report_generator.calls), 1)
+        self.assertTrue(result.report_path.is_file())
+        self.assertTrue(result.history_path.is_file())
+        self.assertEqual(store.get_run(result.run_id).report_status, "succeeded")
+
+    async def test_incremental_partial_and_all_failed_statuses_are_persisted(self) -> None:
+        partial_store = InMemoryPostStore()
+        partial_runner = DigestTaskRunner(
+            x_provider=MockXIngestionProvider(
+                page_failures={
+                    ("mock://empty", 1): RuntimeError("injected list failure")
+                }
+            ),
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=partial_store,
+        )
+        partial = await partial_runner.run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed", "mock://empty"],
+                output_dir=self.output_dir / "partial",
+                incremental=True,
+            )
+        )
+
+        self.assertEqual(partial.status, "partial")
+        self.assertEqual(partial.ingestion_status, "partial_success")
+        self.assertTrue(partial.report_path and partial.report_path.is_file())
+        self.assertEqual(partial_store.get_run(partial.run_id).status, "partial_success")
+
+        failed_store = InMemoryPostStore()
+        failed_runner = DigestTaskRunner(
+            x_provider=MockXIngestionProvider(
+                page_failures={
+                    ("mock://empty", 1): RuntimeError("injected list failure")
+                }
+            ),
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=failed_store,
+        )
+        failed = await failed_runner.run(
+            DigestTaskRequest.from_values(
+                ["mock://empty"],
+                output_dir=self.output_dir / "failed",
+                incremental=True,
+            )
+        )
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.ingestion_status, "failed")
+        self.assertIsNone(failed.report_path)
+        self.assertEqual(failed_store.get_run(failed.run_id).status, "failed")
+
+    async def test_incremental_progress_and_canonical_provider_skip_legacy_login(self) -> None:
+        class CanonicalProvider(MockXIngestionProvider):
+            async def login(self):
+                raise AssertionError("canonical provider must not use a legacy login probe")
+
+        events: list[TaskProgress] = []
+        runner = DigestTaskRunner(
+            x_provider=CanonicalProvider(),
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            progress_callback=events.append,
+            post_store=InMemoryPostStore(),
+        )
+
+        result = await runner.run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                page_size=2,
+            )
+        )
+
+        self.assertTrue(result.success)
+        ingestion_events = [event for event in events if event.phase == "ingesting"]
+        self.assertGreaterEqual(len(ingestion_events), 1)
+        self.assertTrue(any("page" in event.message for event in ingestion_events))
+        self.assertTrue(any("new" in event.message for event in ingestion_events))
+
+    async def test_no_new_posts_skips_llm_report_and_history(self) -> None:
+        store = InMemoryPostStore()
+        first = DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        )
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"], output_dir=self.output_dir, incremental=True
+        )
+        first_result = await first.run(request)
+        history_before = first_result.history_path.read_bytes()
+        summary_provider = MockSummaryProvider()
+        report_generator = MockReportGenerator()
+        second = DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            summary_provider=summary_provider,
+            report_generator=report_generator,
+            post_store=store,
+        )
+
+        result = await second.run(request)
+
+        self.assertEqual(result.status, "no_new_posts")
+        self.assertTrue(result.success)
+        self.assertEqual(result.new_post_count, 0)
+        self.assertEqual(summary_provider.calls, [])
+        self.assertEqual(report_generator.calls, [])
+        self.assertIsNone(result.report_path)
+        self.assertEqual(first_result.history_path.read_bytes(), history_before)
+
+    async def test_report_failure_keeps_checkpoint_and_resumes_without_x_call(self) -> None:
+        class FailingReport:
+            def generate_html_report(self, *_args, **_kwargs):
+                raise RuntimeError("injected report failure")
+
+        store = InMemoryPostStore()
+        provider = MockXIngestionProvider()
+        failing = DigestTaskRunner(
+            x_provider=provider,
+            summary_provider=MockSummaryProvider(),
+            report_generator=FailingReport(),
+            post_store=store,
+        )
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"], output_dir=self.output_dir, incremental=True
+        )
+
+        failed = await failing.run(request)
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(store.get_sync_state("mock://mixed").newest_post_id, "9005")
+        stored_run = store.get_run(failed.run_id)
+        self.assertEqual(stored_run.status, "success")
+        self.assertEqual(stored_run.report_status, "failed")
+        x_calls = len(provider.fetch_calls)
+
+        retry = DigestTaskRunner(
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        )
+        retry_request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            incremental=True,
+            resume_ingestion_run_id=failed.run_id,
+        )
+        retried = await retry.run(retry_request)
+
+        self.assertEqual(retried.status, "succeeded")
+        self.assertTrue(retried.report_path.is_file())
+        self.assertEqual(len(provider.fetch_calls), x_calls)
+        self.assertEqual(store.get_run(failed.run_id).report_status, "succeeded")
+
+        repeated = await retry.run(retry_request)
+        self.assertEqual(repeated.status, "failed")
+        self.assertIn("already complete", repeated.error or "")
+        self.assertEqual(store.get_run(failed.run_id).report_status, "succeeded")
+
+    async def test_only_one_process_can_claim_the_same_report(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingSummary:
+            async def summarize(self, _aggregated):
+                started.set()
+                await release.wait()
+                return "claimed summary"
+
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            incremental=True,
+            resume_ingestion_run_id=fetched.run_id,
+        )
+        first_runner = DigestTaskRunner(
+            summary_provider=BlockingSummary(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        )
+        second_runner = DigestTaskRunner(
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        )
+
+        first_task = asyncio.create_task(first_runner.run(request))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second = await second_runner.run(request)
+        self.assertEqual(second.status, "failed")
+        self.assertIn("in progress", second.error or "")
+        self.assertEqual(store.get_run(fetched.run_id).report_status, "generating")
+
+        release.set()
+        first = await first_task
+        self.assertEqual(first.status, "succeeded")
+        self.assertEqual(store.get_run(fetched.run_id).report_status, "succeeded")
+
+    async def test_replaced_report_owner_cannot_publish_history_or_success(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+        new_started = asyncio.Event()
+
+        class OldBlockingSummary:
+            async def summarize(self, _aggregated):
+                old_started.set()
+                await release_old.wait()
+                return "old owner summary"
+
+        class NewBlockingSummary:
+            async def summarize(self, _aggregated):
+                new_started.set()
+                await asyncio.Event().wait()
+
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            incremental=True,
+            resume_ingestion_run_id=fetched.run_id,
+        )
+        stale_clock = datetime.now(timezone.utc) - timedelta(hours=2)
+        old_task = asyncio.create_task(
+            DigestTaskRunner(
+                summary_provider=OldBlockingSummary(),
+                report_generator=MockReportGenerator(),
+                post_store=store,
+                now_factory=lambda: stale_clock,
+            ).run(request)
+        )
+        await asyncio.wait_for(old_started.wait(), timeout=2)
+        old_claim = store.get_run(fetched.run_id).report_claim_id
+        self.assertTrue(old_claim)
+
+        new_task = asyncio.create_task(
+            DigestTaskRunner(
+                summary_provider=NewBlockingSummary(),
+                report_generator=MockReportGenerator(),
+                post_store=store,
+            ).run(request)
+        )
+        try:
+            await asyncio.wait_for(new_started.wait(), timeout=2)
+            new_claim = store.get_run(fetched.run_id).report_claim_id
+            self.assertTrue(new_claim)
+            self.assertNotEqual(old_claim, new_claim)
+
+            release_old.set()
+            old_result = await asyncio.wait_for(old_task, timeout=2)
+
+            current = store.get_run(fetched.run_id)
+            self.assertEqual(old_result.status, "failed")
+            self.assertEqual(current.report_status, "generating")
+            self.assertEqual(current.report_claim_id, new_claim)
+            self.assertFalse((self.output_dir / "history.json").exists())
+        finally:
+            if not old_task.done():
+                old_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await old_task
+            if not new_task.done():
+                new_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await new_task
+
+    async def test_fixed_report_takeover_preserves_new_owner_artifacts(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        old_generator_started = asyncio.Event()
+        release_old_generator = asyncio.Event()
+
+        class BlockingOldReport:
+            async def generate_html_report(
+                self, _aggregated, _summary, output_path, **_kwargs
+            ):
+                old_generator_started.set()
+                await release_old_generator.wait()
+                path = Path(output_path)
+                path.write_text("<html>OLD OWNER</html>", encoding="utf-8")
+                return path
+
+        class NewOwnerReport:
+            def generate_html_report(
+                self, _aggregated, _summary, output_path, **_kwargs
+            ):
+                path = Path(output_path)
+                path.write_text("<html>NEW OWNER</html>", encoding="utf-8")
+                return path
+
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            incremental=True,
+            resume_ingestion_run_id=fetched.run_id,
+            report_filename="shared-report.html",
+        )
+        stale_clock = datetime.now(timezone.utc) - timedelta(hours=2)
+        old_task = asyncio.create_task(
+            DigestTaskRunner(
+                summary_provider=MockSummaryProvider(),
+                report_generator=BlockingOldReport(),
+                post_store=store,
+                now_factory=lambda: stale_clock,
+            ).run(request)
+        )
+        await asyncio.wait_for(old_generator_started.wait(), timeout=2)
+
+        try:
+            new_result = await asyncio.wait_for(
+                DigestTaskRunner(
+                    summary_provider=MockSummaryProvider(),
+                    report_generator=NewOwnerReport(),
+                    post_store=store,
+                ).run(request),
+                timeout=2,
+            )
+            self.assertEqual(new_result.status, "succeeded")
+            self.assertEqual(
+                (self.output_dir / "shared-report.html").read_text(encoding="utf-8"),
+                "<html>NEW OWNER</html>",
+            )
+        finally:
+            release_old_generator.set()
+
+        old_result = await asyncio.wait_for(old_task, timeout=2)
+        final_report = self.output_dir / "shared-report.html"
+        history = json.loads(
+            (self.output_dir / "history.json").read_text(encoding="utf-8")
+        )
+        durable = store.get_run(fetched.run_id)
+
+        self.assertEqual(old_result.status, "failed")
+        self.assertEqual(final_report.read_text(encoding="utf-8"), "<html>NEW OWNER</html>")
+        self.assertEqual(history[final_report.name]["status"], "succeeded")
+        self.assertEqual(history[final_report.name]["run_id"], fetched.run_id)
+        self.assertEqual(durable.report_status, "succeeded")
+        self.assertIsNone(durable.report_claim_id)
+        self.assertEqual(list(self.output_dir.glob(".report-*.tmp.html")), [])
+
+    async def test_cancelled_report_releases_claim_and_can_retry(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        started = asyncio.Event()
+
+        class BlockingSummary:
+            async def summarize(self, _aggregated):
+                started.set()
+                await asyncio.Event().wait()
+
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            incremental=True,
+            resume_ingestion_run_id=fetched.run_id,
+        )
+        task = asyncio.create_task(
+            DigestTaskRunner(
+                summary_provider=BlockingSummary(),
+                report_generator=MockReportGenerator(),
+                post_store=store,
+            ).run(request)
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        cancelled = store.get_run(fetched.run_id)
+        self.assertEqual(cancelled.report_status, "failed")
+        self.assertIsNone(cancelled.report_claim_id)
+        self.assertIsNone(cancelled.report_claimed_at)
+
+        retried = await DigestTaskRunner(
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        ).run(request)
+        self.assertEqual(retried.status, "succeeded")
+
+    async def test_cancelled_complete_progress_preserves_committed_artifacts(self) -> None:
+        store = InMemoryPostStore()
+        run_id = "cancel-commit"
+
+        async def cancel_on_complete(event: TaskProgress) -> None:
+            if event.phase == "complete":
+                raise asyncio.CancelledError
+
+        runner = DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            progress_callback=cancel_on_complete,
+            post_store=store,
+            run_id_factory=lambda: run_id,
+        )
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            incremental=True,
+            report_filename="committed-before-cancel.html",
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await runner.run(request)
+
+        report_path = self.output_dir / "committed-before-cancel.html"
+        history_path = self.output_dir / "history.json"
+        durable = store.get_run(run_id)
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(durable.status, "success")
+        self.assertEqual(durable.report_status, "succeeded")
+        self.assertIsNone(durable.report_claim_id)
+        self.assertTrue(report_path.is_file())
+        self.assertIn(report_path.name, history)
+        self.assertEqual(history[report_path.name]["run_id"], run_id)
+        self.assertEqual(list(self.output_dir.glob(".report-*.tmp.html")), [])
+
+    async def test_stale_report_claim_is_reclaimed_with_a_new_owner(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        stale = store.get_run(fetched.run_id)
+        stale.report_status = "generating"
+        stale.report_claim_id = "crashed-owner"
+        stale.report_claimed_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        store.update_run(stale)
+
+        resumed = await DigestTaskRunner(
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                resume_ingestion_run_id=fetched.run_id,
+            )
+        )
+
+        final = store.get_run(fetched.run_id)
+        self.assertEqual(resumed.status, "succeeded")
+        self.assertEqual(final.report_status, "succeeded")
+        self.assertIsNone(final.report_claim_id)
+        self.assertIsNone(final.report_claimed_at)
+
+    async def test_summary_failure_keeps_checkpoint_and_resumes_without_x_call(self) -> None:
+        store = InMemoryPostStore()
+        provider = MockXIngestionProvider()
+        failing = DigestTaskRunner(
+            x_provider=provider,
+            summary_provider=MockSummaryProvider(fail=True),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        )
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"], output_dir=self.output_dir, incremental=True
+        )
+
+        failed = await failing.run(request)
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(store.get_sync_state("mock://mixed").newest_post_id, "9005")
+        self.assertEqual(store.get_run(failed.run_id).report_status, "failed")
+        x_calls = len(provider.fetch_calls)
+
+        retried = await DigestTaskRunner(
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                resume_ingestion_run_id=failed.run_id,
+            )
+        )
+
+        self.assertEqual(retried.status, "succeeded")
+        self.assertEqual(len(provider.fetch_calls), x_calls)
+        self.assertEqual(store.get_run(failed.run_id).report_status, "succeeded")
+
+    async def test_failed_durable_run_can_resume_and_is_finalized(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        interrupted = store.get_run(fetched.run_id)
+        interrupted.status = "failed"
+        interrupted.finished_at = None
+        interrupted.report_status = "not_started"
+        store.update_run(interrupted)
+        newer_state = store.get_sync_state("mock://mixed")
+        newer_state.last_run_id = "a-newer-no-new-run"
+        store.save_sync_state(newer_state)
+
+        resumed = await DigestTaskRunner(
+            summary_provider=MockSummaryProvider(),
+            report_generator=MockReportGenerator(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                resume_ingestion_run_id=fetched.run_id,
+            )
+        )
+
+        finalized = store.get_run(fetched.run_id)
+        self.assertEqual(resumed.status, "succeeded")
+        self.assertEqual(finalized.status, "success")
+        self.assertIsNotNone(finalized.finished_at)
+        self.assertEqual(finalized.report_status, "succeeded")
+
+    async def test_fresh_running_ingestion_run_cannot_be_resumed(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        active = store.get_run(fetched.run_id)
+        active.status = "running"
+        active.finished_at = None
+        active.ingestion_owner_id = "active-ingestion-owner"
+        active.ingestion_heartbeat_at = datetime.now(timezone.utc)
+        active.report_status = "not_started"
+        store.update_run(active)
+
+        summary_provider = MockSummaryProvider()
+        report_generator = MockReportGenerator()
+
+        result = await DigestTaskRunner(
+            summary_provider=summary_provider,
+            report_generator=report_generator,
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                resume_ingestion_run_id=fetched.run_id,
+            )
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("completed ingestion run", result.error or "")
+        current = store.get_run(fetched.run_id)
+        self.assertEqual(current.status, "running")
+        self.assertEqual(current.ingestion_owner_id, "active-ingestion-owner")
+        self.assertEqual(current.report_status, "not_started")
+        self.assertEqual(summary_provider.calls, [])
+        self.assertEqual(report_generator.calls, [])
+        self.assertFalse((self.output_dir / "history.json").exists())
+
+    async def test_stale_running_ingestion_resumes_stored_posts_and_completes_report(self) -> None:
+        store = InMemoryPostStore()
+        fetched = await DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                fetch_only=True,
+            )
+        )
+        stale = store.get_run(fetched.run_id)
+        stale.status = "running"
+        stale.finished_at = None
+        stale.ingestion_owner_id = "crashed-ingestion-owner"
+        stale.ingestion_heartbeat_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        stale.report_status = "not_started"
+        store.update_run(stale)
+        summary_provider = MockSummaryProvider()
+        report_generator = MockReportGenerator()
+
+        result = await DigestTaskRunner(
+            summary_provider=summary_provider,
+            report_generator=report_generator,
+            post_store=store,
+        ).run(
+            DigestTaskRequest.from_values(
+                ["mock://mixed"],
+                output_dir=self.output_dir,
+                incremental=True,
+                resume_ingestion_run_id=fetched.run_id,
+            )
+        )
+
+        finalized = store.get_run(fetched.run_id)
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.new_post_count, 5)
+        self.assertTrue(result.report_path and result.report_path.is_file())
+        self.assertTrue(result.history_path and result.history_path.is_file())
+        self.assertEqual(len(summary_provider.calls), 1)
+        self.assertEqual(len(report_generator.calls), 1)
+        self.assertEqual(finalized.status, "success")
+        self.assertIsNotNone(finalized.finished_at)
+        self.assertIsNone(finalized.ingestion_owner_id)
+        self.assertEqual(finalized.report_status, "succeeded")
+        self.assertTrue(
+            any(
+                item.get("kind") == "stale_ingestion_recovered"
+                for item in finalized.errors
+            )
+        )
+
+    async def test_fetch_only_persists_without_resolving_llm_or_report(self) -> None:
+        store = InMemoryPostStore()
+        runner = DigestTaskRunner(
+            x_provider=MockXIngestionProvider(),
+            post_store=store,
+        )
+        request = DigestTaskRequest.from_values(
+            ["mock://mixed"],
+            output_dir=self.output_dir,
+            incremental=True,
+            fetch_only=True,
+        )
+
+        result = await runner.run(request)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.new_post_count, 5)
+        self.assertIsNone(result.report_path)
+        self.assertEqual(store.get_run(result.run_id).report_status, "skipped_fetch_only")
+
 
 class OfflineCliTests(unittest.TestCase):
     def test_python_module_mock_entry_behavior(self) -> None:
@@ -545,6 +1275,34 @@ class OfflineCliTests(unittest.TestCase):
             reports = list(Path(directory).glob("summary_*.html"))
             self.assertEqual(1, len(reports))
             self.assertTrue((Path(directory) / "history.json").exists())
+
+    def test_incremental_fetch_only_cli_is_idempotent(self) -> None:
+        with workspace_temporary_directory() as directory:
+            data_dir = directory / "data"
+            arguments = [
+                "--mock",
+                "--fetch-only",
+                "--list",
+                "mock://mixed",
+                "--data-dir",
+                str(data_dir),
+                "--output-dir",
+                str(directory / "output"),
+                "--page-size",
+                "2",
+            ]
+            first_stdout = io.StringIO()
+            with contextlib.redirect_stdout(first_stdout):
+                first_exit = main(arguments)
+            second_stdout = io.StringIO()
+            with contextlib.redirect_stdout(second_stdout):
+                second_exit = main(arguments)
+
+            self.assertEqual(first_exit, 0)
+            self.assertEqual(second_exit, 0)
+            self.assertIn('"new_post_count": 5', first_stdout.getvalue())
+            self.assertIn('"status": "no_new_posts"', second_stdout.getvalue())
+            self.assertEqual(list((directory / "output").glob("*.html")), [])
 
 
 if __name__ == "__main__":
