@@ -51,6 +51,7 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
                         "options": {"openai": {"api_key": self.api_key}},
                     },
                     "twitter": {"api_bearer_token": self.bearer},
+                    "articles": {"enabled": False},
                 }
             ),
         )
@@ -140,6 +141,26 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cleared["summarization"]["options"]["openai"]["api_key"], "")
         self.assertEqual(cleared["twitter"]["api_bearer_token"], "")
 
+    def test_article_settings_round_trip_through_unified_config(self):
+        status, _, raw = self.request(
+            "/api/save-config",
+            data={
+                "articles": {
+                    "enabled": True,
+                    "max_articles_per_run": 7,
+                    "cache_ttl_hours": 48,
+                    "timeout_seconds": 9,
+                }
+            },
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(json.loads(raw)["success"])
+        stored = load_config(web_ui.CONFIG_PATH)["articles"]
+        self.assertIs(stored["enabled"], True)
+        self.assertEqual(7, stored["max_articles_per_run"])
+        self.assertEqual(48, stored["cache_ttl_hours"])
+        self.assertEqual(9, stored["timeout_seconds"])
+
     def test_root_sandboxes_reports_and_escapes_history_fields_in_renderer(self):
         status, headers, raw = self.request("/")
         page = raw.decode("utf-8")
@@ -193,6 +214,10 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('class="feature-grid"', page)
         self.assertIn('id="run-btn" onclick="startAnalysis()"', page)
         self.assertIn("Run Analysis", page)
+        self.assertIn('id="s_articles_enabled"', page)
+        self.assertIn('id="s_articles_max"', page)
+        self.assertIn('id="s_articles_ttl"', page)
+        self.assertIn('id="s_articles_timeout"', page)
 
     def test_non_local_host_is_rejected_for_control_api(self):
         request = urllib.request.Request(

@@ -501,6 +501,7 @@ class DigestTaskRunner:
         fetch_delay_factory: FetchDelayFactory | None = None,
         post_store: PostStore | None = None,
         ingestion_service: IncrementalIngestionService | None = None,
+        article_service: Any | None = None,
     ) -> None:
         direct_x = [value is not None for value in (x_provider, fetcher)]
         if sum(direct_x) > 1:
@@ -533,6 +534,7 @@ class DigestTaskRunner:
         self._fetch_delay_factory = fetch_delay_factory
         self._post_store = post_store
         self._ingestion_service = ingestion_service
+        self._article_service = article_service
 
     def _safe_error(self, error: Any) -> str:
         """Return a provider error with known credentials redacted."""
@@ -1011,6 +1013,25 @@ class DigestTaskRunner:
                 )
                 await progress("complete", 100, "No new posts; summary skipped")
                 return build_result(final_status)
+
+            if self._article_service is not None:
+                await progress("articles", 66, "Extracting external articles")
+                try:
+                    await _invoke(
+                        self._article_service.process_posts,
+                        canonical_posts,
+                        run_id=run_id,
+                    )
+                except Exception as article_error:
+                    # Posts and their checkpoints were committed by ingestion
+                    # before this optional enrichment boundary. Article
+                    # failures must not roll that durable state back or block
+                    # the existing report path.
+                    logger.error(
+                        "[%s] Article enrichment failed (%s)",
+                        run_id,
+                        type(article_error).__name__,
+                    )
 
             ingestion_run = self._claim_ingestion_report(store, run_id)
             report_claimed = True

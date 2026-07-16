@@ -23,6 +23,9 @@ if str(PROJECT_ROOT) not in sys.path:
 ROOT_DIR = PROJECT_ROOT
 
 from app.x_list_summarizer import XListFetcher, XApiFetcher
+from app.article_fetcher import ArticleFetchConfig, ArticleFetcher
+from app.article_service import ArticleService, ArticleServiceConfig
+from app.article_storage import FileArticleStore
 from app.llm_providers import LLMProvider
 from app.config import (
     atomic_write_json,
@@ -611,6 +614,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         """Delegate the digest workflow to the injectable task runner."""
         secrets = []
         fetcher = None
+        article_service = None
         try:
             config = self.load_config()
             twitter_config = config.get('twitter', {})
@@ -660,6 +664,18 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 else ROOT_DIR / configured_data_dir
             )
             post_store = FilePostStore(data_dir) if incremental else None
+            articles_config = config.get('articles', {})
+            if incremental and articles_config.get('enabled', True):
+                article_service = ArticleService(
+                    store=FileArticleStore(
+                        data_dir,
+                        cache_ttl_hours=articles_config.get('cache_ttl_hours', 168),
+                    ),
+                    fetcher=ArticleFetcher(
+                        config=ArticleFetchConfig.from_mapping(articles_config)
+                    ),
+                    config=ArticleServiceConfig.from_mapping(articles_config),
+                )
             resumable_run = (
                 _find_resumable_report_run(post_store)
                 if post_store is not None
@@ -673,6 +689,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 max_concurrency=max(1, len(list_urls)),
                 fetch_delay_factory=lambda index: index * (0.3 + random.random() * 0.5),
                 post_store=post_store,
+                article_service=article_service,
             )
             request = DigestTaskRequest.from_values(
                 resumable_run.requested_lists if resumable_run is not None else list_urls,
@@ -719,6 +736,11 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 'running': False,
             })
         finally:
+            if article_service is not None:
+                try:
+                    await article_service.aclose()
+                except Exception:
+                    logger.warning("Could not close article fetcher")
             close_provider = getattr(fetcher, 'close_ingestion_provider', None)
             if callable(close_provider):
                 try:
@@ -1313,6 +1335,24 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 </div>
 
                 <div class="card">
+                    <div class="sec-title">📰 External Articles</div>
+                    <label style="display:flex; gap:10px; align-items:center;">
+                        <input type="checkbox" id="s_articles_enabled" style="width:auto; margin:0;">
+                        Extract article text from external post links
+                    </label>
+                    <span class="hint" style="margin-top:8px;">Uses bounded HTTP requests without X cookies, browser automation, or JavaScript.</span>
+
+                    <label>Max Articles per Run</label>
+                    <input type="number" id="s_articles_max" min="1" max="100" value="20">
+
+                    <label>Cache TTL (Hours)</label>
+                    <input type="number" id="s_articles_ttl" min="1" value="168">
+
+                    <label>Request Timeout (Seconds)</label>
+                    <input type="number" id="s_articles_timeout" min="1" max="120" value="15">
+                </div>
+
+                <div class="card">
                     <div class="sec-title" style="justify-content: space-between;">
                         <div style="display: flex; align-items: center; gap: 12px;">
                             <span>🤖</span> AI Intelligence
@@ -1668,6 +1708,11 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
                 document.getElementById('s_prov').value = cfg.summarization.provider;
                 document.getElementById('s_owner').value = cfg.twitter.list_owner || '';
                 document.getElementById('s_fetch_method').value = cfg.twitter.fetch_method || 'twikit';
+                const articles = cfg.articles || {};
+                document.getElementById('s_articles_enabled').checked = articles.enabled !== false;
+                document.getElementById('s_articles_max').value = articles.max_articles_per_run || 20;
+                document.getElementById('s_articles_ttl').value = articles.cache_ttl_hours || 168;
+                document.getElementById('s_articles_timeout').value = articles.timeout_seconds || 15;
                 const bearer = document.getElementById('s_bearer');
                 bearer.value = '';
                 bearer.placeholder = cfg.twitter.api_bearer_token_configured
@@ -1771,6 +1816,11 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             newCfg.twitter.list_urls = document.getElementById('s_urls').value.split('\\n').filter(x => x.trim());
             newCfg.twitter.max_tweets = Math.max(1, safeInteger(document.getElementById('s_max').value) || 100);
             newCfg.twitter.list_owner = document.getElementById('s_owner').value || null;
+            newCfg.articles = newCfg.articles || {};
+            newCfg.articles.enabled = document.getElementById('s_articles_enabled').checked;
+            newCfg.articles.max_articles_per_run = Math.max(1, safeInteger(document.getElementById('s_articles_max').value) || 20);
+            newCfg.articles.cache_ttl_hours = Math.max(1, safeInteger(document.getElementById('s_articles_ttl').value) || 168);
+            newCfg.articles.timeout_seconds = Math.max(1, safeInteger(document.getElementById('s_articles_timeout').value) || 15);
             newCfg.summarization.options[p] = newCfg.summarization.options[p] || {};
             
             const sel = document.getElementById('p_mod_select');

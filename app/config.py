@@ -86,6 +86,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "storage": {
         "data_dir": "data",
     },
+    "articles": {
+        "enabled": True,
+        "timeout_seconds": 15,
+        "max_redirects": 5,
+        "max_response_bytes": 5_242_880,
+        "max_article_chars": 50_000,
+        "cache_ttl_hours": 168,
+        "failure_retry_hours": 6,
+        "max_articles_per_run": 20,
+        "retry_attempts": 2,
+        "user_agent": "x-ai-daily/1.0",
+    },
 }
 
 SUPPORTED_PROVIDERS = tuple(DEFAULT_CONFIG["summarization"]["options"])
@@ -213,6 +225,27 @@ def normalize_config(config: Any) -> dict[str, Any]:
     storage = normalized["storage"]
     if not storage["data_dir"].strip():
         storage["data_dir"] = DEFAULT_CONFIG["storage"]["data_dir"]
+
+    articles = normalized["articles"]
+    for positive_field in (
+        "timeout_seconds",
+        "max_response_bytes",
+        "max_article_chars",
+        "cache_ttl_hours",
+        "max_articles_per_run",
+    ):
+        if articles[positive_field] <= 0:
+            articles[positive_field] = DEFAULT_CONFIG["articles"][positive_field]
+    for bounded_field, maximum in (("max_redirects", 10), ("retry_attempts", 5)):
+        if articles[bounded_field] < 0:
+            articles[bounded_field] = DEFAULT_CONFIG["articles"][bounded_field]
+        articles[bounded_field] = min(maximum, articles[bounded_field])
+    if articles["failure_retry_hours"] < 0:
+        articles["failure_retry_hours"] = DEFAULT_CONFIG["articles"][
+            "failure_retry_hours"
+        ]
+    if not articles["user_agent"].strip():
+        articles["user_agent"] = DEFAULT_CONFIG["articles"]["user_agent"]
 
     return normalized
 

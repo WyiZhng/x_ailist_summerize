@@ -64,6 +64,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["twitter"]["page_size"], 100)
         self.assertEqual(DEFAULT_CONFIG["twitter"]["max_pages"], 20)
         self.assertEqual(DEFAULT_CONFIG["storage"]["data_dir"], "data")
+        self.assertIs(DEFAULT_CONFIG["articles"]["enabled"], True)
+        self.assertEqual(DEFAULT_CONFIG["articles"]["max_articles_per_run"], 20)
+        self.assertEqual(DEFAULT_CONFIG["articles"]["cache_ttl_hours"], 168)
 
     def test_normalize_deep_merges_old_partial_config_without_mutating_default(self):
         defaults_before = copy.deepcopy(DEFAULT_CONFIG)
@@ -103,6 +106,18 @@ class ConfigTests(unittest.TestCase):
                     "max_pages": -1,
                 },
                 "storage": {"data_dir": ""},
+                "articles": {
+                    "enabled": "yes",
+                    "timeout_seconds": 0,
+                    "max_redirects": 99,
+                    "max_response_bytes": -1,
+                    "max_article_chars": 0,
+                    "cache_ttl_hours": 0,
+                    "failure_retry_hours": -1,
+                    "max_articles_per_run": 0,
+                    "retry_attempts": 99,
+                    "user_agent": "",
+                },
             }
         )
 
@@ -118,6 +133,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result["twitter"]["page_size"], 100)
         self.assertEqual(result["twitter"]["max_pages"], 20)
         self.assertEqual(result["storage"]["data_dir"], "data")
+        self.assertEqual(result["articles"]["timeout_seconds"], 15)
+        self.assertEqual(result["articles"]["max_redirects"], 10)
+        self.assertEqual(result["articles"]["max_response_bytes"], 5_242_880)
+        self.assertEqual(result["articles"]["max_article_chars"], 50_000)
+        self.assertEqual(result["articles"]["cache_ttl_hours"], 168)
+        self.assertEqual(result["articles"]["failure_retry_hours"], 6)
+        self.assertEqual(result["articles"]["max_articles_per_run"], 20)
+        self.assertEqual(result["articles"]["retry_attempts"], 5)
+        self.assertEqual(result["articles"]["user_agent"], "x-ai-daily/1.0")
 
     def test_load_corrupt_json_falls_back_without_touching_original(self):
         with workspace_temp_directory() as directory:

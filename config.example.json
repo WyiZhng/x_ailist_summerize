@@ -2,6 +2,18 @@
     "storage": {
         "data_dir": "data"
     },
+    "articles": {
+        "enabled": true,
+        "timeout_seconds": 15,
+        "max_redirects": 5,
+        "max_response_bytes": 5242880,
+        "max_article_chars": 50000,
+        "cache_ttl_hours": 168,
+        "failure_retry_hours": 6,
+        "max_articles_per_run": 20,
+        "retry_attempts": 2,
+        "user_agent": "x-ai-daily/1.0"
+    },
     "twitter": {
         "list_urls": [
             "https://x.com/i/lists/YOUR_LIST_ID_HERE"
