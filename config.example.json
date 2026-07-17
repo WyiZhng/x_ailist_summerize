@@ -36,6 +36,19 @@
         "push_enabled": true,
         "max_notification_attempts": 3
     },
+    "events": {
+        "enabled": true,
+        "max_events_per_day": 20,
+        "must_read_limit": 5,
+        "minimum_final_score": 45,
+        "candidate_similarity_high": 0.82,
+        "candidate_similarity_low": 0.55,
+        "pair_review_top_k": 8,
+        "max_analysis_chars_per_item": 12000,
+        "max_llm_requests_per_run": 40,
+        "max_prompt_tokens_per_run": 120000,
+        "output_language": "zh-CN"
+    },
     "twitter": {
         "list_urls": [
             "https://x.com/i/lists/YOUR_LIST_ID_HERE"

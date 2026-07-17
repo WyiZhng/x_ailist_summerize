@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from .config import activate_project_environment, load_config
+from .event_pipeline import run_pipeline
+from .event_report import render_chinese_report
 from .daily_delivery_models import DailyDeliveryStore
 from .process_lock import ProcessLock
 from .task_runner import DigestTaskRequest, DigestTaskRunner
@@ -99,6 +101,14 @@ class DailyDeliveryService:
                 relative = (
                     result.report_path.resolve().relative_to(PROJECT_ROOT).as_posix()
                 )
+                if self.config["events"]["enabled"]:
+                    events, _ = run_pipeline(
+                        day,
+                        data_dir=PROJECT_ROOT / self.config["storage"]["data_dir"],
+                        config=self.config,
+                    )
+                    if events:
+                        render_chinese_report(events, result.report_path)
                 delivery = self.store.update(
                     delivery,
                     generation_status="success",

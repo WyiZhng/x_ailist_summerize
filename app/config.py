@@ -119,6 +119,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "push_enabled": True,
         "max_notification_attempts": 3,
     },
+    "events": {
+        "enabled": True,
+        "max_events_per_day": 20,
+        "must_read_limit": 5,
+        "minimum_final_score": 45,
+        "candidate_similarity_high": 0.82,
+        "candidate_similarity_low": 0.55,
+        "pair_review_top_k": 8,
+        "max_analysis_chars_per_item": 12000,
+        "max_llm_requests_per_run": 40,
+        "max_prompt_tokens_per_run": 120000,
+        "output_language": "zh-CN",
+    },
 }
 
 SUPPORTED_PROVIDERS = tuple(DEFAULT_CONFIG["summarization"]["options"])
@@ -313,6 +326,24 @@ def normalize_config(config: Any) -> dict[str, Any]:
     for field in ("tick_interval_seconds", "max_notification_attempts"):
         if delivery[field] <= 0:
             delivery[field] = DEFAULT_CONFIG["daily_delivery"][field]
+
+    events = normalized["events"]
+    for field in (
+        "max_events_per_day",
+        "must_read_limit",
+        "pair_review_top_k",
+        "max_analysis_chars_per_item",
+        "max_llm_requests_per_run",
+        "max_prompt_tokens_per_run",
+    ):
+        if events[field] <= 0:
+            events[field] = DEFAULT_CONFIG["events"][field]
+    events["max_events_per_day"] = min(events["max_events_per_day"], 20)
+    events["must_read_limit"] = min(
+        events["must_read_limit"], 5, events["max_events_per_day"]
+    )
+    if events["output_language"] != "zh-CN":
+        events["output_language"] = "zh-CN"
 
     return normalized
 
