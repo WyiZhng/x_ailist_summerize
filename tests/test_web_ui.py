@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 import os
 import shutil
 import threading
@@ -110,6 +112,46 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(payload["twitter"]["api_bearer_token_configured"])
         self.assertTrue(payload["twitter"]["cookies_configured"])
+
+    def test_status_does_not_block_on_external_health_checks(self):
+        finished = threading.Event()
+
+        class SlowFetcher:
+            async def verify_session(self, retries=0):
+                await asyncio.sleep(0.3)
+                return False, "X timeout"
+
+        class SlowProvider:
+            def __init__(self, _config):
+                pass
+
+            def verify(self):
+                time.sleep(0.3)
+                finished.set()
+                return {"active": True, "message": "Ready"}
+
+        for attribute in ("_x_cache", "_ai_cache", "_x_cache_time", "_ai_cache_time"):
+            if hasattr(web_ui.DashHandler, attribute):
+                delattr(web_ui.DashHandler, attribute)
+
+        with (
+            mock.patch.object(web_ui, "_build_fetcher", return_value=SlowFetcher()),
+            mock.patch.object(web_ui, "LLMProvider", SlowProvider),
+        ):
+            started = time.monotonic()
+            status, _, raw = self.request("/api/status")
+            elapsed = time.monotonic() - started
+            initial = json.loads(raw)
+
+            self.assertEqual(status, 200)
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(initial["x_auth"]["message"], "Checking...")
+            self.assertTrue(finished.wait(2))
+
+            _, _, raw = self.request("/api/status")
+            refreshed = json.loads(raw)
+            self.assertEqual(refreshed["x_auth"]["message"], "X timeout")
+            self.assertTrue(refreshed["ai_status"]["active"])
 
     def test_blank_secret_submission_preserves_and_explicit_clear_removes(self):
         status, _, raw = self.request(

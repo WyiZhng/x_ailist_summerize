@@ -90,6 +90,7 @@ STATIC_FILES = {
 
 class DashHandler(http.server.SimpleHTTPRequestHandler):
     _run_lock = threading.Lock()
+    _health_check_lock = threading.Lock()
 
     def __init__(self, *args, **kwargs):
         self.app_state = kwargs.pop('app_state', {})
@@ -203,6 +204,12 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
 
     def _load_cookie_credentials(self):
         """Return valid saved X cookies, without exposing their values."""
+        environment_cookies = {
+            "auth_token": os.environ.get("XLS_X_AUTH_TOKEN", "").strip(),
+            "ct0": os.environ.get("XLS_X_CT0", "").strip(),
+        }
+        if all(environment_cookies.values()):
+            return environment_cookies
         try:
             data = json.loads(COOKIES_PATH.read_text(encoding='utf-8'))
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -215,6 +222,67 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         ):
             return None
         return data
+
+    @classmethod
+    def _refresh_health_status(cls, config, cookies_configured):
+        """Refresh external health state without blocking status requests."""
+        try:
+            method = config.get('twitter', {}).get('fetch_method', 'twikit')
+            bearer = config.get('twitter', {}).get('api_bearer_token')
+            has_creds = (method == 'api' and bearer) or (
+                method == 'twikit' and cookies_configured
+            )
+            x_status = {'active': False, 'message': 'Not logged in'}
+            if has_creds:
+                try:
+                    fetcher = _build_fetcher(config)
+                    success, message = asyncio.run(fetcher.verify_session(retries=0))
+                    x_status = {'active': success, 'message': message}
+                except Exception as exc:
+                    logger.warning("X health check failed (%s)", type(exc).__name__)
+                    x_status = {'active': False, 'message': 'Auth Error'}
+            elif method == 'api':
+                x_status = {'active': False, 'message': 'No Bearer Token'}
+
+            try:
+                ai_status = LLMProvider(config).verify()
+            except Exception as exc:
+                logger.warning("AI health check failed (%s)", type(exc).__name__)
+                ai_status = {'active': False, 'message': 'Error'}
+
+            completed_at = time.time()
+            cls._x_cache = x_status
+            cls._x_cache_time = completed_at
+            cls._ai_cache = ai_status
+            cls._ai_cache_time = completed_at
+        finally:
+            cls._health_check_lock.release()
+
+    def _schedule_health_refresh(self, now):
+        """Start at most one external health refresh when cached state is stale."""
+        if self.app_state.get('running'):
+            return
+        last_x = getattr(DashHandler, '_x_cache', None)
+        last_ai = getattr(DashHandler, '_ai_cache', None)
+        last_x_time = getattr(DashHandler, '_x_cache_time', 0)
+        last_ai_time = getattr(DashHandler, '_ai_cache_time', 0)
+        x_limit = 30 if (last_x and last_x.get('active')) else 5
+        ai_limit = 30 if (last_ai and last_ai.get('active')) else 5
+        stale = (now - last_x_time > x_limit) or (now - last_ai_time > ai_limit)
+        if not stale or not DashHandler._health_check_lock.acquire(blocking=False):
+            return
+        try:
+            config = self.load_config()
+            cookies_configured = self._load_cookie_credentials() is not None
+            threading.Thread(
+                target=DashHandler._refresh_health_status,
+                args=(config, cookies_configured),
+                daemon=True,
+                name="health-refresh",
+            ).start()
+        except Exception:
+            DashHandler._health_check_lock.release()
+            raise
 
     def _resolve_report_path(self, filename):
         """Resolve a generated report without following an escaping symlink."""
@@ -285,57 +353,13 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
             
         elif parsed.path == '/api/status':
             now = time.time()
-            limit_ok = 30 # 30 seconds for healthy status
-            limit_err = 5  # Only 5 seconds for error/invalid status
-            
-            # 1. X Auth Verification (Cached)
-            last_x = getattr(DashHandler, '_x_cache', None)
-            last_x_time = getattr(DashHandler, '_x_cache_time', 0)
-            
-            x_aged = (now - last_x_time)
-            x_limit = limit_ok if (last_x and last_x.get('active')) else limit_err
-            
-            if not last_x or x_aged > x_limit:
-                x_status = {'active': False, 'message': 'Not logged in'}
-                cfg = self.load_config()
-                method = cfg.get('twitter', {}).get('fetch_method', 'twikit')
-                has_creds = (method == 'api' and cfg.get('twitter', {}).get('api_bearer_token')) or \
-                            (method == 'twikit' and self._load_cookie_credentials() is not None)
-                if has_creds:
-                    try:
-                        fetcher = _build_fetcher(cfg)
-                        loop = asyncio.new_event_loop()
-                        success, msg = loop.run_until_complete(fetcher.verify_session(retries=2))
-                        x_status = {'active': success, 'message': msg}
-                        loop.close()
-                    except Exception as exc:
-                        logger.warning("X health check failed (%s)", type(exc).__name__)
-                        x_status = {'active': False, 'message': 'Auth Error'}
-                elif method == 'api':
-                    x_status = {'active': False, 'message': 'No Bearer Token'}
-                DashHandler._x_cache = x_status
-                DashHandler._x_cache_time = now
-            else: x_status = DashHandler._x_cache
-            
-            # 2. AI Verification (Cached)
-            last_ai = getattr(DashHandler, '_ai_cache', None)
-            last_ai_time = getattr(DashHandler, '_ai_cache_time', 0)
-            
-            ai_aged = (now - last_ai_time)
-            ai_limit = limit_ok if (last_ai and last_ai.get('active')) else limit_err
-
-            if not last_ai or ai_aged > ai_limit:
-                ai_status = {'active': False, 'message': 'Checking...'}
-                try:
-                    config = self.load_config()
-                    provider = LLMProvider(config)
-                    ai_status = provider.verify()
-                    DashHandler._ai_cache = ai_status
-                    DashHandler._ai_cache_time = now
-                except Exception as exc:
-                    logger.warning("AI health check failed (%s)", type(exc).__name__)
-                    ai_status = {'active': False, 'message': 'Error'}
-            else: ai_status = DashHandler._ai_cache
+            self._schedule_health_refresh(now)
+            x_status = getattr(
+                DashHandler, '_x_cache', {'active': False, 'message': 'Checking...'}
+            )
+            ai_status = getattr(
+                DashHandler, '_ai_cache', {'active': False, 'message': 'Checking...'}
+            )
 
             self.send_json({
                 'running': self.app_state.get('running', False),
@@ -585,7 +609,7 @@ class DashHandler(http.server.SimpleHTTPRequestHandler):
         return load_app_config(CONFIG_PATH)
 
     def save_config(self, config):
-        current = load_app_config(CONFIG_PATH)
+        current = load_app_config(CONFIG_PATH, use_environment=False)
         save_app_config(config, CONFIG_PATH, current=current)
 
     def save_history_metadata(self, filename, meta):

@@ -76,8 +76,11 @@ class XListFetcher:
         list_owner=None,
         proxy=None,
     ):
-        # Some httpx/twikit versions treat an explicit proxy=None as disabling
-        # proxy discovery, so only pass the keyword when a proxy is configured.
+        proxy = proxy or os.environ.get("XLS_X_PROXY") or os.environ.get(
+            "HTTPS_PROXY"
+        ) or os.environ.get("https_proxy")
+        # Pass the resolved proxy explicitly because Twikit forwards proxy=None
+        # to httpx, which is not reliable across httpx versions and environments.
         self.client = Client('en-US', proxy=proxy) if proxy else Client('en-US')
         self.cookies_path = Path(cookies_path)
         self.list_owner_pref = list_owner
@@ -108,6 +111,18 @@ class XListFetcher:
             # Error reporting must never hide the original failure.
             pass
         return redact_sensitive_text(str(error), secrets=secrets)
+
+    def _load_session_cookies(self) -> bool:
+        """Load X cookies from environment first, then the saved cookie file."""
+        auth_token = os.environ.get("XLS_X_AUTH_TOKEN", "").strip()
+        ct0 = os.environ.get("XLS_X_CT0", "").strip()
+        if auth_token and ct0:
+            self.client.set_cookies({"auth_token": auth_token, "ct0": ct0})
+            return True
+        if not self.cookies_path.exists():
+            return False
+        self.client.load_cookies(str(self.cookies_path))
+        return True
 
     @staticmethod
     def _is_cloudflare_forbidden(message: str) -> bool:
@@ -249,19 +264,8 @@ class XListFetcher:
         
     async def login(self):
         """Load cookies and verify login."""
-        if not self.cookies_path.exists():
-            result = SessionVerificationResult(
-                SessionVerificationState.INVALID,
-                False,
-                False,
-                "Cookies file not found. Please login via settings.",
-                "cookies_missing",
-            )
-            self._record_session_verification(result)
-            return False, result.message
-
         try:
-            self.client.load_cookies(str(self.cookies_path))
+            loaded = self._load_session_cookies()
         except Exception as error:
             result = SessionVerificationResult(
                 SessionVerificationState.INVALID,
@@ -269,6 +273,14 @@ class XListFetcher:
                 False,
                 f"Cookies could not be loaded: {self._safe_error(error)[:120]}",
                 "cookies_unreadable",
+            )
+            self._record_session_verification(result)
+            return False, result.message
+        if not loaded:
+            result = SessionVerificationResult(
+                SessionVerificationState.INVALID, False, False,
+                "Cookies not configured. Please use environment variables or settings.",
+                "cookies_missing",
             )
             self._record_session_verification(result)
             return False, result.message
@@ -279,19 +291,8 @@ class XListFetcher:
 
     async def verify_session(self, retries=1):
         """Lightweight check to see if current session is still valid with retry for transient errors."""
-        if not self.cookies_path.exists():
-            result = SessionVerificationResult(
-                SessionVerificationState.INVALID,
-                False,
-                False,
-                "No cookies",
-                "cookies_missing",
-            )
-            self._record_session_verification(result)
-            return False, result.message
-
         try:
-            self.client.load_cookies(str(self.cookies_path))
+            loaded = self._load_session_cookies()
         except Exception as error:
             result = SessionVerificationResult(
                 SessionVerificationState.INVALID,
@@ -299,6 +300,13 @@ class XListFetcher:
                 False,
                 f"Cookies could not be loaded: {self._safe_error(error)[:120]}",
                 "cookies_unreadable",
+            )
+            self._record_session_verification(result)
+            return False, result.message
+        if not loaded:
+            result = SessionVerificationResult(
+                SessionVerificationState.INVALID, False, False,
+                "No cookies", "cookies_missing",
             )
             self._record_session_verification(result)
             return False, result.message
@@ -514,7 +522,8 @@ class XListFetcher:
     async def get_user_memberships(self, username: str):
         """Fetch all lists that a specific user is a member of (Profiler feature)."""
         try:
-            self.client.load_cookies(str(self.cookies_path))
+            if not self._load_session_cookies():
+                raise RuntimeError("X cookies are not configured")
             user_id = await self.get_user_id(username)
             
             memberships = []

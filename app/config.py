@@ -250,7 +250,9 @@ def normalize_config(config: Any) -> dict[str, Any]:
     return normalized
 
 
-def load_config(path: Path | str = CONFIG_PATH) -> dict[str, Any]:
+def load_config(
+    path: Path | str = CONFIG_PATH, *, use_environment: bool = True
+) -> dict[str, Any]:
     """Load and normalize a JSON config without ever modifying the source.
 
     A missing, unreadable, malformed, or non-object file safely falls back to
@@ -262,8 +264,32 @@ def load_config(path: Path | str = CONFIG_PATH) -> dict[str, Any]:
         with target.open("r", encoding="utf-8") as handle:
             raw = json.load(handle)
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return copy.deepcopy(DEFAULT_CONFIG)
-    return normalize_config(raw)
+        raw = copy.deepcopy(DEFAULT_CONFIG)
+
+    config = normalize_config(raw)
+    if not use_environment:
+        return config
+    provider = os.environ.get("XLS_LLM_PROVIDER", "").strip().lower()
+    if provider in SUPPORTED_PROVIDERS:
+        config["summarization"]["provider"] = provider
+
+    active_provider = config["summarization"]["provider"]
+    model = os.environ.get("XLS_LLM_MODEL", "").strip()
+    api_key = os.environ.get("XLS_LLM_API_KEY", "").strip()
+    if model:
+        config["summarization"]["options"][active_provider]["model"] = model
+    if api_key:
+        config["summarization"]["options"][active_provider]["api_key"] = api_key
+
+    list_urls = os.environ.get("XLS_X_LIST_URLS", "")
+    if list_urls.strip():
+        config["twitter"]["list_urls"] = [
+            value.strip()
+            for line in list_urls.splitlines()
+            for value in line.split(",")
+            if value.strip()
+        ]
+    return config
 
 
 def _safe_mask(value: Any) -> str:
@@ -430,7 +456,11 @@ def save_config(
     ``current`` is injectable for callers/tests.  When omitted, the existing
     target is loaded.  Empty secret inputs retain values from that base.
     """
-    base = load_config(path) if current is None else normalize_config(current)
+    base = (
+        load_config(path, use_environment=False)
+        if current is None
+        else normalize_config(current)
+    )
     merged = merge_config_update(base, config)
     atomic_write_json(path, merged)
     return merged

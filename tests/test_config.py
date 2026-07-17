@@ -154,6 +154,46 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(result, DEFAULT_CONFIG)
             self.assertEqual(path.read_bytes(), damaged)
 
+    def test_environment_overrides_runtime_configuration(self):
+        environment = {
+            "XLS_LLM_PROVIDER": "deepseek",
+            "XLS_LLM_MODEL": "test-model",
+            "XLS_LLM_API_KEY": "test-secret",
+            "XLS_X_LIST_URLS": "https://x.com/i/lists/1\nhttps://x.com/i/lists/2",
+        }
+        with workspace_temp_directory() as directory, mock.patch.dict(
+            "os.environ", environment, clear=False
+        ):
+            result = load_config(directory / "missing.json")
+
+        self.assertEqual(result["summarization"]["provider"], "deepseek")
+        self.assertEqual(
+            result["summarization"]["options"]["deepseek"]["model"], "test-model"
+        )
+        self.assertEqual(
+            result["summarization"]["options"]["deepseek"]["api_key"], "test-secret"
+        )
+        self.assertEqual(
+            result["twitter"]["list_urls"],
+            ["https://x.com/i/lists/1", "https://x.com/i/lists/2"],
+        )
+
+    def test_environment_can_be_excluded_from_persistent_configuration(self):
+        environment = {
+            "XLS_LLM_PROVIDER": "deepseek",
+            "XLS_LLM_API_KEY": "must-not-be-persisted",
+        }
+        with workspace_temp_directory() as directory, mock.patch.dict(
+            "os.environ", environment, clear=False
+        ):
+            path = directory / "config.json"
+            saved = save_config({"twitter": {"max_tweets": 25}}, path)
+            persisted = path.read_text(encoding="utf-8")
+
+        self.assertEqual(saved["summarization"]["provider"], "ollama")
+        self.assertNotIn("api_key", saved["summarization"]["options"]["ollama"])
+        self.assertNotIn("must-not-be-persisted", persisted)
+
     def test_public_config_removes_all_raw_secrets(self):
         config = normalize_config(
             {

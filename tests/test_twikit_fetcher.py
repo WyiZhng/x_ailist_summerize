@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from app.ingestion import IncrementalIngestionService
 from app.storage import InMemoryPostStore
@@ -102,6 +104,15 @@ class TwikitFetcherTestCase(unittest.IsolatedAsyncioTestCase):
         fetcher = XListFetcher(cookies_path=self.cookies_path)
         fetcher.client = client
         return fetcher
+
+    def test_https_proxy_is_passed_explicitly_to_twikit(self) -> None:
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://127.0.0.1:7897"}), \
+             mock.patch("app.x_list_summarizer.Client") as client_class:
+            XListFetcher(cookies_path=self.cookies_path)
+
+        client_class.assert_called_once_with(
+            "en-US", proxy="http://127.0.0.1:7897"
+        )
 
 
 class TwikitSessionVerificationTests(TwikitFetcherTestCase):
