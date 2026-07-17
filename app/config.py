@@ -98,6 +98,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retry_attempts": 2,
         "user_agent": "x-ai-daily/1.0",
     },
+    "weixin": {
+        "enabled": False,
+        "data_dir": "data/weixin",
+        "poll_timeout_seconds": 35,
+        "request_timeout_seconds": 45,
+        "retry_attempts": 3,
+        "maximum_backoff_seconds": 120,
+        "allowed_report_extensions": [".html"],
+    },
 }
 
 SUPPORTED_PROVIDERS = tuple(DEFAULT_CONFIG["summarization"]["options"])
@@ -109,7 +118,8 @@ def _looks_sensitive_key(key: Any) -> bool:
     normalized = str(key).strip().lower().replace("-", "_")
     return bool(
         normalized in SECRET_KEYS
-        or normalized in {
+        or normalized
+        in {
             "authorization",
             "auth_token",
             "client_secret",
@@ -186,9 +196,17 @@ def _merge_with_defaults(defaults: Any, supplied: Any) -> Any:
         return result
 
     if isinstance(defaults, list):
-        return copy.deepcopy(supplied) if isinstance(supplied, list) else copy.deepcopy(defaults)
+        return (
+            copy.deepcopy(supplied)
+            if isinstance(supplied, list)
+            else copy.deepcopy(defaults)
+        )
 
-    return copy.deepcopy(supplied) if _valid_scalar(defaults, supplied) else copy.deepcopy(defaults)
+    return (
+        copy.deepcopy(supplied)
+        if _valid_scalar(defaults, supplied)
+        else copy.deepcopy(defaults)
+    )
 
 
 def normalize_config(config: Any) -> dict[str, Any]:
@@ -246,6 +264,25 @@ def normalize_config(config: Any) -> dict[str, Any]:
         ]
     if not articles["user_agent"].strip():
         articles["user_agent"] = DEFAULT_CONFIG["articles"]["user_agent"]
+
+    weixin = normalized["weixin"]
+    if not weixin["data_dir"].strip():
+        weixin["data_dir"] = DEFAULT_CONFIG["weixin"]["data_dir"]
+    for positive_field in (
+        "poll_timeout_seconds",
+        "request_timeout_seconds",
+        "retry_attempts",
+        "maximum_backoff_seconds",
+    ):
+        if weixin[positive_field] <= 0:
+            weixin[positive_field] = DEFAULT_CONFIG["weixin"][positive_field]
+    allowed_extensions = weixin["allowed_report_extensions"]
+    if not allowed_extensions or not all(
+        isinstance(item, str) and item.startswith(".") for item in allowed_extensions
+    ):
+        weixin["allowed_report_extensions"] = copy.deepcopy(
+            DEFAULT_CONFIG["weixin"]["allowed_report_extensions"]
+        )
 
     return normalized
 
@@ -315,16 +352,20 @@ def get_public_config(config: Any) -> dict[str, Any]:
         if isinstance(node, Mapping):
             public: dict[str, Any] = {}
             for key, value in node.items():
-                credentialed_endpoint = (
-                    str(key).lower() == "endpoint" and _endpoint_contains_credentials(value)
-                )
+                credentialed_endpoint = str(
+                    key
+                ).lower() == "endpoint" and _endpoint_contains_credentials(value)
                 if _looks_sensitive_key(key) or credentialed_endpoint:
-                    configured = bool(str(value).strip()) if value is not None else False
+                    configured = (
+                        bool(str(value).strip()) if value is not None else False
+                    )
                     public[f"{key}_configured"] = configured
                     public[f"{key}_mask"] = (
                         "configured URL (credentials hidden)"
                         if configured and credentialed_endpoint
-                        else _safe_mask(value) if configured else ""
+                        else _safe_mask(value)
+                        if configured
+                        else ""
                     )
                 else:
                     public[key] = redact(value)
@@ -357,18 +398,23 @@ def _is_secret_metadata(key: str) -> bool:
     return key.startswith("clear_") and _looks_sensitive_key(key[6:])
 
 
-def _merge_update(current: Mapping[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
+def _merge_update(
+    current: Mapping[str, Any], update: Mapping[str, Any]
+) -> dict[str, Any]:
     result = copy.deepcopy(dict(current))
 
     # A clear flag is useful when the client received a public config that did
     # not contain the original secret field at all.
     secret_keys = {str(key) for key in result if _looks_sensitive_key(key)}
     secret_keys.update(
-        str(key) for key in update
+        str(key)
+        for key in update
         if _looks_sensitive_key(key) and not _is_secret_metadata(str(key))
     )
     for secret_key in secret_keys:
-        if _clear_requested(update, secret_key) and (secret_key in result or secret_key in update):
+        if _clear_requested(update, secret_key) and (
+            secret_key in result or secret_key in update
+        ):
             result[secret_key] = ""
 
     for key, value in update.items():
@@ -492,7 +538,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.ensure:
         parser.error("an action is required (use --ensure)")
     created = ensure_config(args.path)
-    print("Created default configuration." if created else "Existing configuration preserved.")
+    print(
+        "Created default configuration."
+        if created
+        else "Existing configuration preserved."
+    )
     return 0
 
 

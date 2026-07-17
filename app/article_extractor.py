@@ -44,7 +44,9 @@ def _clean_scalar(value: Any, limit: int) -> str | None:
 def _meta(soup: BeautifulSoup, *keys: str) -> str | None:
     wanted = {item.lower() for item in keys}
     for tag in soup.find_all("meta"):
-        key = str(tag.get("property") or tag.get("name") or tag.get("itemprop") or "").lower()
+        key = str(
+            tag.get("property") or tag.get("name") or tag.get("itemprop") or ""
+        ).lower()
         if key in wanted:
             value = _clean_scalar(tag.get("content"), 2000)
             if value:
@@ -78,6 +80,15 @@ def _visible_text_blocks(container) -> list[str]:
 def extract_article(html: str, *, max_article_chars: int = 50_000) -> ExtractedArticle:
     if not isinstance(html, str) or not html.strip():
         return ExtractedArticle(None, None, None, None, None, None, None, None, None)
+    # BeautifulSoup 4.15 keeps the remainder of a malformed document inside an
+    # unclosed title element. Repair only this narrow, deterministic pattern so
+    # body/article fallbacks remain available across parser versions.
+    title_open = re.search(r"<title(?:\s[^>]*)?>", html, flags=re.IGNORECASE)
+    head_close = re.search(r"</head\s*>", html, flags=re.IGNORECASE)
+    if title_open and head_close and title_open.end() < head_close.start():
+        between = html[title_open.end() : head_close.start()]
+        if not re.search(r"</title\s*>", between, flags=re.IGNORECASE):
+            html = html[: head_close.start()] + "</title>" + html[head_close.start() :]
     soup = BeautifulSoup(html, "html.parser")
 
     canonical_urls = list(
@@ -93,7 +104,9 @@ def extract_article(html: str, *, max_article_chars: int = 50_000) -> ExtractedA
         title = _clean_scalar(soup.title.get_text(" ", strip=True), 500)
     if not title:
         heading = soup.find("h1")
-        title = _clean_scalar(heading.get_text(" ", strip=True), 500) if heading else None
+        title = (
+            _clean_scalar(heading.get_text(" ", strip=True), 500) if heading else None
+        )
     author = _meta(soup, "author", "article:author", "byl")
     published_at = _parse_published(
         _meta(
@@ -111,7 +124,17 @@ def extract_article(html: str, *, max_article_chars: int = 50_000) -> ExtractedA
     language = _clean_scalar(html_tag.get("lang"), 40) if html_tag else None
 
     for tag in soup.find_all(
-        ["script", "style", "nav", "header", "footer", "form", "noscript", "svg", "iframe"]
+        [
+            "script",
+            "style",
+            "nav",
+            "header",
+            "footer",
+            "form",
+            "noscript",
+            "svg",
+            "iframe",
+        ]
     ):
         tag.decompose()
     for tag in soup.find_all(True):
@@ -155,7 +178,11 @@ def extract_article(html: str, *, max_article_chars: int = 50_000) -> ExtractedA
         content = content[:max_article_chars].rstrip()
     content_text = content or None
     content_hash = stable_sha256(content_text) if content_text else None
-    word_count = len(re.findall(r"\b\w+\b", content_text, flags=re.UNICODE)) if content_text else None
+    word_count = (
+        len(re.findall(r"\b\w+\b", content_text, flags=re.UNICODE))
+        if content_text
+        else None
+    )
     return ExtractedArticle(
         title=title,
         author=author,

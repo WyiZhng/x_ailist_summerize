@@ -14,6 +14,17 @@
         "retry_attempts": 2,
         "user_agent": "x-ai-daily/1.0"
     },
+    "weixin": {
+        "enabled": false,
+        "data_dir": "data/weixin",
+        "poll_timeout_seconds": 35,
+        "request_timeout_seconds": 45,
+        "retry_attempts": 3,
+        "maximum_backoff_seconds": 120,
+        "allowed_report_extensions": [
+            ".html"
+        ]
+    },
     "twitter": {
         "list_urls": [
             "https://x.com/i/lists/YOUR_LIST_ID_HERE"
