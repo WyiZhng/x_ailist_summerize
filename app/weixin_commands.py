@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 from .weixin_models import WeixinCommandResult
 from .weixin_subscription import WeixinSubscriptionStore
+from .event_summary import top5_text
 
 
 HELP_TEXT = """可用命令：
@@ -212,6 +213,11 @@ class WeixinCommandHandler:
         report = self.report_locator.latest()
         if report is None:
             return WeixinCommandResult("daily", "尚未找到已生成的 AI 日报。")
+        structured = top5_text(
+            self.report_locator.output_dir.parent / "data", report.generated_at.date()
+        )
+        if structured:
+            return WeixinCommandResult("daily", structured)
         metadata = report.metadata
         text = (
             f"AI 每日情报｜{report.generated_at:%Y-%m-%d}\n\n"

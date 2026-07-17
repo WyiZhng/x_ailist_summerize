@@ -6,6 +6,7 @@ from app.content_filter import filter_item
 from app.chinese_content_validator import validate_chinese
 from app.event_pipeline import run_pipeline
 from app.event_report import render_chinese_report
+from app.event_summary import top5_text
 from app.models import XPost, XPostMetrics
 from app.storage import FilePostStore
 
@@ -69,3 +70,6 @@ def test_pipeline_is_stable_and_preserves_sources(tmp_path: Path):
     report = tmp_path / "report.html"
     render_chinese_report(events, report)
     assert "AI 每日情报" in report.read_text(encoding="utf-8")
+    assert top5_text(tmp_path, date(2026, 7, 18)) and "今日必读" in top5_text(
+        tmp_path, date(2026, 7, 18)
+    )

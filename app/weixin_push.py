@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import load_config
 from .daily_delivery_models import DailyDeliveryStore
+from .event_summary import top5_text
 from .weixin_client import WeixinAuthenticationError, WeixinClient
 from .weixin_commands import ReportLocator
 from .weixin_models import DailyDelivery, PushResult, WeixinSubscription
@@ -73,7 +74,10 @@ class WeixinPushService:
                 ).total_seconds()
             ),
         )
-        text = f"AI 每日情报｜{delivery.delivery_date:%Y-%m-%d}\n\n今日报告已生成\n生成时间：{(delivery.report_generated_at or datetime.now(timezone.utc)):%H:%M}\n\n完整 HTML 报告已附在下一条消息中。"
+        text = (
+            top5_text(self.report_root.parent / "data", delivery.delivery_date)
+            or f"AI 每日情报｜{delivery.delivery_date:%Y-%m-%d}\n\n今日报告已生成\n生成时间：{(delivery.report_generated_at or datetime.now(timezone.utc)):%H:%M}\n\n完整 HTML 报告已附在下一条消息中。"
+        )
         self.deliveries.update(
             delivery,
             notification_status="sending",

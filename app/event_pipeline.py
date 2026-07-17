@@ -11,6 +11,10 @@ from .config import load_config
 from .content_builder import build_content_items
 from .content_filter import filter_item
 from .content_models import Claim, EventCluster
+from .content_analysis import (
+    DeepSeekContentAnalysisProvider,
+    MockContentAnalysisProvider,
+)
 from .storage import FilePostStore
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +35,13 @@ def _zh_title(text: str) -> str:
 
 
 def run_pipeline(
-    day: date, *, data_dir: Path, config: dict, max_items: int = 20
+    day: date,
+    *,
+    data_dir: Path,
+    config: dict,
+    max_items: int = 20,
+    use_llm: bool = False,
+    mock: bool = False,
 ) -> tuple[list[EventCluster], dict[str, int]]:
     posts = FilePostStore(data_dir).read_posts()[:max_items]
     article_store = FileArticleStore(data_dir)
@@ -44,6 +54,21 @@ def run_pipeline(
             config["summarization"]["provider"]
         ].get("model", ""),
     )
+    provider = (
+        (
+            MockContentAnalysisProvider()
+            if mock
+            else DeepSeekContentAnalysisProvider(
+                config,
+                data_dir / "events" / "llm_cache",
+                max_requests=config["events"]["max_llm_requests_per_run"],
+                max_tokens=config["events"]["max_prompt_tokens_per_run"],
+            )
+        )
+        if use_llm
+        else None
+    )
+    analyzed: dict[str, object] = {}
     kept = []
     filtered = 0
     for item in items:
@@ -51,15 +76,31 @@ def run_pipeline(
         if decision.decision == "drop":
             filtered += 1
         else:
+            if provider and decision.decision == "needs_semantic_review":
+                try:
+                    result = provider.analyze(item)
+                    analyzed[item.id] = result
+                    if not result.keep:
+                        filtered += 1
+                        continue
+                except Exception:
+                    pass
             kept.append(item)
     groups: dict[str, list] = {}
     for item in kept:
         key = (
             item.article_ids[0]
             if item.article_ids
-            else hashlib.sha256(item.post_text_original.lower().encode()).hexdigest()[
-                :16
-            ]
+            else hashlib.sha256(
+                (
+                    " ".join(
+                        sorted(
+                            set(item.post_text_original.lower().split())
+                            - {"the", "a", "an"}
+                        )
+                    )[:120]
+                ).encode()
+            ).hexdigest()[:16]
         )
         groups.setdefault(key, []).append(item)
     events = []
@@ -71,7 +112,8 @@ def run_pipeline(
             + min(20, len(group) * 8)
             + min(5, sum((x.engagement.get("likes") or 0) for x in group) // 100),
         )
-        title = _zh_title(primary.post_text_original)
+        result = analyzed.get(primary.id)
+        title = result.title_zh if result else _zh_title(primary.post_text_original)
         eid = (
             "event:" + hashlib.sha256((day.isoformat() + key).encode()).hexdigest()[:16]
         )
@@ -80,10 +122,14 @@ def run_pipeline(
                 eid,
                 day,
                 title,
-                f"来源内容显示：{primary.post_text_original[:120]}",
-                "该信息与 AI、开发工具或技术生态相关，建议结合原始来源进一步判断。",
-                "developer_tool",
-                "fact",
+                result.summary_zh
+                if result
+                else f"来源内容显示：{primary.post_text_original[:120]}",
+                result.why_it_matters_zh
+                if result
+                else "该信息与 AI、开发工具或技术生态相关，建议结合原始来源进一步判断。",
+                result.event_type if result else "developer_tool",
+                result.factuality if result else "fact",
                 [Claim("来源内容已被收录。", "fact", 0.6, [x.id for x in group])],
                 [x.id for x in group],
                 [p for x in group for p in x.post_ids],
@@ -122,8 +168,10 @@ def run_pipeline(
         "clusters": len(groups),
         "events": len(events),
         "must_read": sum(e.must_read for e in events),
-        "llm_requests": 0,
-        "cache_hits": 0,
+        "llm_requests": provider.requests if provider else 0,
+        "cache_hits": provider.hits if provider else 0,
+        "prompt_tokens": provider.prompt_tokens if provider else 0,
+        "completion_tokens": provider.completion_tokens if provider else 0,
     }
 
 
@@ -143,6 +191,8 @@ def main(argv=None) -> int:
         data_dir=PROJECT_ROOT / a.data_dir,
         config=c,
         max_items=min(20, a.max_items),
+        use_llm=not a.no_llm,
+        mock=a.mock,
     )
     print("中文事件分析完成：" + json.dumps(stats, ensure_ascii=False))
     return 0
