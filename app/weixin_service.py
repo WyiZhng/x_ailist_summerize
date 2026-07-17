@@ -19,6 +19,7 @@ from .weixin_client import (
 from .weixin_commands import ReportLocator, WeixinCommandHandler
 from .weixin_models import WeixinInboundMessage, WeixinSyncState, WeixinUpdateBatch
 from .weixin_state import WeixinStateError, WeixinStateStore
+from .weixin_subscription import WeixinSubscriptionStore
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class WeixinService:
         command_handler: WeixinCommandHandler,
         retry_attempts: int = 3,
         maximum_backoff_seconds: int = 120,
+        subscription_store: WeixinSubscriptionStore | None = None,
     ) -> None:
         self.client = client
         self.state_store = state_store
@@ -43,6 +45,7 @@ class WeixinService:
         self.retry_attempts = max(1, retry_attempts)
         self.maximum_backoff_seconds = max(1, maximum_backoff_seconds)
         self.stop_event = asyncio.Event()
+        self.subscription_store = subscription_store
 
     def stop(self) -> None:
         """Request graceful shutdown after the current operation."""
@@ -64,7 +67,46 @@ class WeixinService:
             message.message_id,
             message.received_at,
         )
-        result = self.command_handler.handle(message.text)
+        if self.subscription_store:
+            self.subscription_store.refresh_context(
+                message.user_id,
+                message.context_token,
+                message.message_id,
+                message.received_at,
+            )
+        result = self.command_handler.handle(message.text, user_id=message.user_id)
+        if result.command == "retry_delivery" and self.subscription_store:
+            from .daily_delivery_models import DailyDeliveryStore
+            from .weixin_push import WeixinPushService
+
+            deliveries = DailyDeliveryStore(PROJECT_ROOT / "data" / "delivery")
+            delivery = deliveries.latest()
+            subscription = self.subscription_store.get(message.user_id)
+            if delivery is None or delivery.generation_status != "success":
+                result = result.__class__(
+                    "retry_delivery", "尚未找到可补发的已生成日报。"
+                )
+            elif delivery.notification_status == "sent":
+                result = result.__class__(
+                    "retry_delivery", "该日报已经成功发送，无需重复补发。"
+                )
+            elif subscription is None:
+                result = result.__class__(
+                    "retry_delivery", "当前会话凭据不可用，请稍后重试。"
+                )
+            else:
+                outcome = await WeixinPushService(
+                    client=self.client,
+                    subscriptions=self.subscription_store,
+                    deliveries=deliveries,
+                    report_root=PROJECT_ROOT / "output",
+                ).send_daily_digest(subscription, delivery)
+                result = result.__class__(
+                    "retry_delivery",
+                    "日报补发成功。"
+                    if outcome.success
+                    else "日报补发失败，等待下次会话凭据刷新后重试。",
+                )
         await self.client.send_typing(message.user_id, message.context_token)
 
         if result.file_path is not None:
@@ -201,6 +243,7 @@ def build_service(config: dict[str, Any]) -> WeixinService:
         report_locator=locator,
         config=config,
         cookies_path=PROJECT_ROOT / "browser_session" / "cookies.json",
+        subscription_store=WeixinSubscriptionStore(state_store),
     )
     client = WeixinClient(
         credentials,
@@ -217,6 +260,7 @@ def build_service(config: dict[str, Any]) -> WeixinService:
         command_handler=handler,
         retry_attempts=weixin_config["retry_attempts"],
         maximum_backoff_seconds=weixin_config["maximum_backoff_seconds"],
+        subscription_store=WeixinSubscriptionStore(state_store),
     )
 
 

@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import tempfile
+import shlex
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlsplit
@@ -106,6 +107,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retry_attempts": 3,
         "maximum_backoff_seconds": 120,
         "allowed_report_extensions": [".html"],
+    },
+    "daily_delivery": {
+        "enabled": False,
+        "timezone": "Asia/Shanghai",
+        "scheduled_hour": 9,
+        "scheduled_minute": 0,
+        "tick_interval_seconds": 300,
+        "catchup_deadline_hour": 12,
+        "generate_when_no_subscription": True,
+        "push_enabled": True,
+        "max_notification_attempts": 3,
     },
 }
 
@@ -284,6 +296,24 @@ def normalize_config(config: Any) -> dict[str, Any]:
             DEFAULT_CONFIG["weixin"]["allowed_report_extensions"]
         )
 
+    delivery = normalized["daily_delivery"]
+    if delivery["timezone"] != "Asia/Shanghai":
+        delivery["timezone"] = "Asia/Shanghai"
+    for field, minimum, maximum in (
+        ("scheduled_hour", 0, 23),
+        ("scheduled_minute", 0, 59),
+        ("catchup_deadline_hour", 0, 23),
+    ):
+        if not minimum <= delivery[field] <= maximum:
+            delivery[field] = DEFAULT_CONFIG["daily_delivery"][field]
+    if delivery["catchup_deadline_hour"] < delivery["scheduled_hour"]:
+        delivery["catchup_deadline_hour"] = DEFAULT_CONFIG["daily_delivery"][
+            "catchup_deadline_hour"
+        ]
+    for field in ("tick_interval_seconds", "max_notification_attempts"):
+        if delivery[field] <= 0:
+            delivery[field] = DEFAULT_CONFIG["daily_delivery"][field]
+
     return normalized
 
 
@@ -297,6 +327,9 @@ def load_config(
     neither rewritten nor renamed here, preserving it for recovery.
     """
     target = Path(path)
+    environment = os.environ
+    if use_environment:
+        environment = _project_environment(target)
     try:
         with target.open("r", encoding="utf-8") as handle:
             raw = json.load(handle)
@@ -306,19 +339,19 @@ def load_config(
     config = normalize_config(raw)
     if not use_environment:
         return config
-    provider = os.environ.get("XLS_LLM_PROVIDER", "").strip().lower()
+    provider = environment.get("XLS_LLM_PROVIDER", "").strip().lower()
     if provider in SUPPORTED_PROVIDERS:
         config["summarization"]["provider"] = provider
 
     active_provider = config["summarization"]["provider"]
-    model = os.environ.get("XLS_LLM_MODEL", "").strip()
-    api_key = os.environ.get("XLS_LLM_API_KEY", "").strip()
+    model = environment.get("XLS_LLM_MODEL", "").strip()
+    api_key = environment.get("XLS_LLM_API_KEY", "").strip()
     if model:
         config["summarization"]["options"][active_provider]["model"] = model
     if api_key:
         config["summarization"]["options"][active_provider]["api_key"] = api_key
 
-    list_urls = os.environ.get("XLS_X_LIST_URLS", "")
+    list_urls = environment.get("XLS_X_LIST_URLS", "")
     if list_urls.strip():
         config["twitter"]["list_urls"] = [
             value.strip()
@@ -327,6 +360,51 @@ def load_config(
             if value.strip()
         ]
     return config
+
+
+def _project_environment(config_path: Path) -> dict[str, str]:
+    """Load only unset ``XLS_`` values from the adjacent private ``.env`` file.
+
+    This tiny parser intentionally avoids shell execution.  It enables local
+    terminal and launchd processes to share the same ignored configuration
+    without copying credentials into a plist or tracked configuration file.
+    """
+
+    environment = dict(os.environ)
+    dotenv = config_path.resolve().parent / ".env"
+    try:
+        lines = dotenv.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return environment
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key.startswith("XLS_") or not key.replace("_", "").isalnum():
+            continue
+        if key in environment:
+            continue
+        try:
+            parsed = shlex.split(value, posix=True)
+        except ValueError:
+            continue
+        if len(parsed) == 1:
+            environment[key] = parsed[0]
+    return environment
+
+
+def activate_project_environment(config_path: Path | str = CONFIG_PATH) -> None:
+    """Expose private runtime values to a process that needs external clients.
+
+    Call this only from a real application entry point, never during ordinary
+    config reads, so tests and web request handling remain isolated.
+    """
+
+    for key, value in _project_environment(Path(config_path)).items():
+        if key.startswith("XLS_") and key not in os.environ:
+            os.environ[key] = value
 
 
 def _safe_mask(value: Any) -> str:

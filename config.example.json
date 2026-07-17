@@ -25,6 +25,17 @@
             ".html"
         ]
     },
+    "daily_delivery": {
+        "enabled": false,
+        "timezone": "Asia/Shanghai",
+        "scheduled_hour": 9,
+        "scheduled_minute": 0,
+        "tick_interval_seconds": 300,
+        "catchup_deadline_hour": 12,
+        "generate_when_no_subscription": true,
+        "push_enabled": true,
+        "max_notification_attempts": 3
+    },
     "twitter": {
         "list_urls": [
             "https://x.com/i/lists/YOUR_LIST_ID_HERE"

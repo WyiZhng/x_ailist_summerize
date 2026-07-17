@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .weixin_models import WeixinCommandResult
+from .weixin_subscription import WeixinSubscriptionStore
 
 
 HELP_TEXT = """可用命令：
@@ -18,6 +19,10 @@ HELP_TEXT = """可用命令：
 日报：查看最新 AI 日报摘要
 完整报告：接收最新 HTML 报告
 状态：查看服务和日报状态
+订阅每日推送：开启每天北京时间 09:00 推送
+取消每日推送：关闭主动推送
+订阅状态：查看订阅与会话凭据状态
+补发日报：补发最近生成但未成功推送的日报
 帮助：查看命令列表"""
 
 COMMAND_ALIASES = {
@@ -34,6 +39,16 @@ COMMAND_ALIASES = {
     "报告文件": "report",
     "状态": "status",
     "服务状态": "status",
+    "订阅每日推送": "subscribe",
+    "订阅日报": "subscribe",
+    "开启每日推送": "subscribe",
+    "取消每日推送": "unsubscribe",
+    "取消订阅": "unsubscribe",
+    "关闭每日推送": "unsubscribe",
+    "订阅状态": "subscription_status",
+    "推送状态": "subscription_status",
+    "补发日报": "retry_delivery",
+    "重新发送日报": "retry_delivery",
 }
 
 
@@ -130,10 +145,12 @@ class WeixinCommandHandler:
         report_locator: ReportLocator,
         config: Mapping[str, Any],
         cookies_path: Path,
+        subscription_store: WeixinSubscriptionStore | None = None,
     ) -> None:
         self.report_locator = report_locator
         self.config = config
         self.cookies_path = cookies_path
+        self.subscription_store = subscription_store
 
     @staticmethod
     def classify(text: str | None) -> str:
@@ -141,7 +158,9 @@ class WeixinCommandHandler:
         normalized = (text or "").strip()
         return COMMAND_ALIASES.get(normalized, "unknown")
 
-    def handle(self, text: str | None) -> WeixinCommandResult:
+    def handle(
+        self, text: str | None, *, user_id: str | None = None
+    ) -> WeixinCommandResult:
         """Execute a local read-only command."""
         command = self.classify(text)
         if command in {"help", "unknown"}:
@@ -150,7 +169,44 @@ class WeixinCommandHandler:
             return self._daily()
         if command == "report":
             return self._report()
+        if command == "status":
+            return self._status()
+        if command == "subscribe" and user_id and self.subscription_store:
+            self.subscription_store.set_enabled(user_id, True)
+            return WeixinCommandResult(
+                command,
+                "每日 AI 日报推送已开启。\n\n计划时间：北京时间 09:00\n当前推送依赖最近一次微信会话凭据。\n若凭据失效，我会在你下次发送消息后自动刷新。",
+            )
+        if command == "unsubscribe" and user_id and self.subscription_store:
+            self.subscription_store.set_enabled(user_id, False)
+            return WeixinCommandResult(
+                command, "每日 AI 日报推送已关闭。历史发送记录会被保留。"
+            )
+        if command == "subscription_status" and user_id and self.subscription_store:
+            return self._subscription_status(user_id)
+        if command == "retry_delivery":
+            return WeixinCommandResult(
+                command, "正在尝试补发最近一份已生成但未成功推送的日报。"
+            )
         return self._status()
+
+    def _subscription_status(self, user_id: str) -> WeixinCommandResult:
+        subscription = (
+            self.subscription_store.get(user_id) if self.subscription_store else None
+        )
+        enabled = bool(subscription and subscription.enabled)
+        context = {"available": "可用", "expired": "已失效"}.get(
+            subscription.context_status if subscription else "unknown", "未知"
+        )
+        latest = "尚未发送"
+        if subscription and subscription.last_push_success_at:
+            latest = "成功"
+        elif subscription and subscription.last_push_error_code:
+            latest = "失败"
+        return WeixinCommandResult(
+            "subscription_status",
+            f"每日推送：{'已开启' if enabled else '已关闭'}\n计划时间：北京时间 09:00\n最近会话凭据：{context}\n最近推送：{latest}",
+        )
 
     def _daily(self) -> WeixinCommandResult:
         report = self.report_locator.latest()

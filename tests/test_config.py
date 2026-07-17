@@ -82,8 +82,12 @@ class ConfigTests(unittest.TestCase):
         result = normalize_config(old)
 
         self.assertEqual(result["summarization"]["provider"], "openai")
-        self.assertEqual(result["summarization"]["options"]["openai"]["api_key"], "sk-old")
-        self.assertEqual(result["summarization"]["options"]["openai"]["model"], "gpt-4o")
+        self.assertEqual(
+            result["summarization"]["options"]["openai"]["api_key"], "sk-old"
+        )
+        self.assertEqual(
+            result["summarization"]["options"]["openai"]["model"], "gpt-4o"
+        )
         self.assertIn("gemini", result["summarization"]["options"])
         self.assertEqual(result["twitter"]["fetch_method"], "twikit")
         self.assertEqual(result["future_section"], {"enabled": True})
@@ -161,8 +165,9 @@ class ConfigTests(unittest.TestCase):
             "XLS_LLM_API_KEY": "test-secret",
             "XLS_X_LIST_URLS": "https://x.com/i/lists/1\nhttps://x.com/i/lists/2",
         }
-        with workspace_temp_directory() as directory, mock.patch.dict(
-            "os.environ", environment, clear=False
+        with (
+            workspace_temp_directory() as directory,
+            mock.patch.dict("os.environ", environment, clear=False),
         ):
             result = load_config(directory / "missing.json")
 
@@ -178,13 +183,35 @@ class ConfigTests(unittest.TestCase):
             ["https://x.com/i/lists/1", "https://x.com/i/lists/2"],
         )
 
+    def test_adjacent_dotenv_supplies_unset_runtime_configuration(self):
+        with (
+            workspace_temp_directory() as directory,
+            mock.patch.dict("os.environ", {}, clear=True),
+        ):
+            path = directory / "config.json"
+            (directory / ".env").write_text(
+                "XLS_LLM_PROVIDER=deepseek\n"
+                "XLS_LLM_MODEL=dotenv-model\n"
+                "XLS_X_LIST_URLS=https://x.com/i/lists/1\n",
+                encoding="utf-8",
+            )
+            result = load_config(path)
+
+        self.assertEqual(result["summarization"]["provider"], "deepseek")
+        self.assertEqual(
+            result["summarization"]["options"]["deepseek"]["model"],
+            "dotenv-model",
+        )
+        self.assertEqual(result["twitter"]["list_urls"], ["https://x.com/i/lists/1"])
+
     def test_environment_can_be_excluded_from_persistent_configuration(self):
         environment = {
             "XLS_LLM_PROVIDER": "deepseek",
             "XLS_LLM_API_KEY": "must-not-be-persisted",
         }
-        with workspace_temp_directory() as directory, mock.patch.dict(
-            "os.environ", environment, clear=False
+        with (
+            workspace_temp_directory() as directory,
+            mock.patch.dict("os.environ", environment, clear=False),
         ):
             path = directory / "config.json"
             saved = save_config({"twitter": {"max_tweets": 25}}, path)
@@ -289,7 +316,9 @@ class ConfigTests(unittest.TestCase):
                 "twitter": {"api_bearer_token": "bearer-new"},
             },
         )
-        self.assertEqual(replaced["summarization"]["options"]["openai"]["api_key"], "sk-new")
+        self.assertEqual(
+            replaced["summarization"]["options"]["openai"]["api_key"], "sk-new"
+        )
         self.assertEqual(replaced["twitter"]["api_bearer_token"], "bearer-new")
 
     def test_explicit_clear_markers_remove_secrets(self):
@@ -306,9 +335,7 @@ class ConfigTests(unittest.TestCase):
         cleared = merge_config_update(
             current,
             {
-                "summarization": {
-                    "options": {"openai": {"api_key": {"clear": True}}}
-                },
+                "summarization": {"options": {"openai": {"api_key": {"clear": True}}}},
                 "twitter": {"api_bearer_token_clear": True},
             },
         )
@@ -335,7 +362,9 @@ class ConfigTests(unittest.TestCase):
             path = directory / "config.json"
             path.write_text('{"old": true}', encoding="utf-8")
 
-            with mock.patch("app.config.os.replace", side_effect=OSError("replace failed")):
+            with mock.patch(
+                "app.config.os.replace", side_effect=OSError("replace failed")
+            ):
                 with self.assertRaises(OSError):
                     atomic_write_json(path, {"new": True})
 
@@ -365,8 +394,12 @@ class ConfigTests(unittest.TestCase):
                 path,
             )
 
-            self.assertEqual(saved["summarization"]["options"]["openai"]["api_key"], "sk-keep")
-            self.assertEqual(saved["summarization"]["options"]["openai"]["model"], "gpt-4.1")
+            self.assertEqual(
+                saved["summarization"]["options"]["openai"]["api_key"], "sk-keep"
+            )
+            self.assertEqual(
+                saved["summarization"]["options"]["openai"]["model"], "gpt-4.1"
+            )
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), saved)
 
 

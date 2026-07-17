@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -78,3 +78,53 @@ class WeixinCommandResult:
     text: str
     file_path: Path | None = None
     display_name: str | None = None
+
+
+@dataclass(frozen=True)
+class WeixinSubscription:
+    """Private per-user subscription and last usable conversation context."""
+
+    user_id: str = field(repr=False)
+    enabled: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    timezone: str = "Asia/Shanghai"
+    scheduled_hour: int = 9
+    scheduled_minute: int = 0
+    last_context_token: str | None = field(default=None, repr=False)
+    last_context_received_at: datetime | None = None
+    last_context_message_id: str | None = field(default=None, repr=False)
+    context_status: str = "unknown"
+    last_push_attempt_at: datetime | None = None
+    last_push_success_at: datetime | None = None
+    last_push_error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class DailyDelivery:
+    """Generation and notification state for one Beijing calendar day."""
+
+    id: str
+    delivery_date: date
+    timezone: str = "Asia/Shanghai"
+    generation_status: str = "pending"
+    report_run_id: str | None = None
+    report_path: str | None = None
+    report_generated_at: datetime | None = None
+    notification_status: str = "pending"
+    notification_attempts: int = 0
+    notification_last_attempt_at: datetime | None = None
+    notification_sent_at: datetime | None = None
+    notification_error_code: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PushResult:
+    """Sanitized outcome for a proactive Weixin delivery."""
+
+    success: bool
+    status: str
+    error_code: str | None = None
+    token_age_seconds: int | None = None
