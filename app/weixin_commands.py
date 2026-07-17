@@ -125,6 +125,14 @@ class ReportLocator:
         generated, path, metadata = max(candidates, key=lambda item: item[0])
         return LatestReport(path=path, metadata=metadata, generated_at=generated)
 
+    def find(self, filename: str) -> LatestReport | None:
+        """Return one explicitly named report after the same sandbox checks."""
+        path = self._safe_path(filename)
+        if path is None:
+            return None
+        generated = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+        return LatestReport(path=path, metadata={}, generated_at=generated)
+
     @staticmethod
     def _generated_at(metadata: Mapping[str, Any], path: Path) -> datetime:
         value = metadata.get("generated_at")

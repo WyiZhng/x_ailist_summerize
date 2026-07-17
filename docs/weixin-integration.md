@@ -92,14 +92,15 @@ HTML 文件作为微信文件发送，可以下载；是否能在手机端直接
 
 ```bash
 .venv/bin/python -m app.weixin_push --status
+.venv/bin/python -m app.weixin_push --preview-latest --date YYYY-MM-DD
 .venv/bin/python -m app.weixin_push --send-test
-.venv/bin/python -m app.weixin_push --send-latest
+.venv/bin/python -m app.weixin_push --send-latest --date YYYY-MM-DD
 .venv/bin/python -m app.daily_delivery --run-now
 .venv/bin/python -m app.daily_delivery --retry-failed
 .venv/bin/python -m app.daily_delivery --status
 ```
 
-报告生成与微信通知状态独立：通知失败只补发，不再次抓取 X 或调用 DeepSeek。主动推送使用每位用户最近私聊的 `context_token`，失效后请发送任意消息刷新；其长期有效期尚未验证。`--send-latest --force` 仅供本机管理员明确重发，并会打印警告。
+预览和发送都只读取已保存的结构化事件与 HTML，不调用 DeepSeek。预览仅显示通过质量闸门的中文 Top 5，不输出用户 ID、Token 或本地路径。报告生成与微信通知状态独立：通知失败只补发，不再次抓取 X 或调用 DeepSeek。主动推送使用每位用户最近私聊的 `context_token`，失效后请发送任意消息刷新；其长期有效期尚未验证。`--send-latest --force` 仅供本机管理员明确重发，并会打印警告。
 
 ## macOS 自动运行
 

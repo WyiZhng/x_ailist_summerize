@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -171,6 +171,41 @@ def build_push_service(config: dict[str, Any]) -> WeixinPushService:
 async def _main_async(args: argparse.Namespace) -> int:
     service = build_push_service(load_config(PROJECT_ROOT / "config.json"))
     try:
+        if args.preview_latest:
+            delivery = (
+                service.deliveries.get(date.fromisoformat(args.date))
+                if args.date
+                else service.deliveries.latest()
+            )
+            day = (
+                date.fromisoformat(args.date)
+                if args.date
+                else (delivery.delivery_date if delivery else None)
+            )
+            if day is None:
+                event_files = sorted(
+                    (PROJECT_ROOT / "data" / "events").glob("????-??-??.json")
+                )
+                for event_file in reversed(event_files):
+                    candidate = date.fromisoformat(event_file.stem)
+                    if top5_text(PROJECT_ROOT / "data", candidate):
+                        day = candidate
+                        break
+            if day is None:
+                print("尚未找到可预览的日报。")
+                return 1
+            text = top5_text(PROJECT_ROOT / "data", day)
+            if not text:
+                for event_file in reversed(
+                    sorted((PROJECT_ROOT / "data" / "events").glob("????-??-??.json"))
+                ):
+                    text = top5_text(
+                        PROJECT_ROOT / "data", date.fromisoformat(event_file.stem)
+                    )
+                    if text:
+                        break
+            print(text or "当前日报尚未生成结构化中文事件。")
+            return 0
         subscriptions = service.subscriptions.all()
         if args.status:
             available = sum(
@@ -204,14 +239,26 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
             print("主动测试发送成功。" if result.success else "主动测试发送失败。")
             return 0 if result.success else 1
-        delivery = service.deliveries.latest()
+        delivery = (
+            service.deliveries.get(date.fromisoformat(args.date))
+            if args.date
+            else service.deliveries.latest()
+        )
         if delivery is None:
-            report = ReportLocator(service.report_root, (".html",)).latest()
+            report = (
+                ReportLocator(service.report_root, (".html",)).find(
+                    f"summary_events_{args.date}.html"
+                )
+                if args.date
+                else ReportLocator(service.report_root, (".html",)).latest()
+            )
             if report is None:
                 print("尚未找到可发送的日报。")
                 return 1
             delivery = service.deliveries.get_or_create(
-                report.generated_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
+                date.fromisoformat(args.date)
+                if args.date
+                else report.generated_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
             )
             delivery = service.deliveries.update(
                 delivery,
@@ -225,7 +272,12 @@ async def _main_async(args: argparse.Namespace) -> int:
         result = await service.send_daily_digest(
             subscription, delivery, force=args.force
         )
-        print("日报发送成功。" if result.success else f"日报未发送：{result.status}")
+        if result.status == "already_sent":
+            print("日报已发送，本次未重复发送。")
+        else:
+            print(
+                "日报发送成功。" if result.success else f"日报未发送：{result.status}"
+            )
         return 0 if result.success else 1
     finally:
         await service.client.close()
@@ -237,7 +289,9 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--send-test", action="store_true")
     group.add_argument("--send-latest", action="store_true")
     group.add_argument("--status", action="store_true")
+    group.add_argument("--preview-latest", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--date")
     return asyncio.run(_main_async(parser.parse_args(argv)))
 
 

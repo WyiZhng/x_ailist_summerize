@@ -20,7 +20,10 @@ def top5_text(
     if not isinstance(events, list):
         return None
     rows = []
-    for index, event in enumerate(events[:limit], 1):
+    must_read = [
+        event for event in events if isinstance(event, dict) and event.get("must_read")
+    ]
+    for index, event in enumerate(must_read[:limit], 1):
         if not isinstance(event, dict):
             continue
         title = str(event.get("title_zh", "")).strip()

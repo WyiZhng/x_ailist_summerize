@@ -1,7 +1,9 @@
 # 中文事件分析
 
-`python -m app.event_pipeline --date YYYY-MM-DD --max-items 20` 只读取已保存的帖子和文章，不会抓取 X 或网页。管线先构造带 `<UNTRUSTED_SOURCE>` 边界的输入，再规则过滤、DeepSeek 结构化语义过滤、精确来源聚合、稳定 ID 排序和 Top 5 标记。`--no-llm` 保持完全离线，`--mock` 使用确定性 Mock。事件数据和 LLM 缓存保存在 Git 忽略的 `data/events/`。
+`python -m app.event_pipeline --date YYYY-MM-DD --max-items 30 --resume` 只读取已保存的帖子和文章，不会抓取 X 或网页。管线先构造带 `<UNTRUSTED_SOURCE>` 边界的输入，再规则过滤、DeepSeek 结构化语义过滤、Top-K 本地召回、灰区 Pair 判断、稳定聚类、质量闸门和 Top 5 标记。`--status` 安全显示恢复状态；`--no-llm` 保持完全离线，`--mock` 使用确定性 Mock。事件数据、manifest、Pair 决策和 LLM 缓存保存在 Git 忽略的 `data/events/`。
 
 缓存键包含输入哈希、Prompt 版本、Schema 版本和模型名称。缓存命中仍会重新检查 JSON 与中文字段；仅记录真实 API 返回的 prompt/completion Token，不自行估算。达到请求或 Token 预算后保留已完成结果并停止新增调用。
 
-评分上限为 100，互动量仅作为很小的辅助信号；同一文章或相同文本不会重复计分。每个事件保留帖子、文章和 URL 引用。相同输入按稳定哈希产生相同事件 ID。
+评分上限为 100，互动量最多 5 分。确定性质量闸门将推广、流量增长和单一来源个人案例排除在“今日必读”之外；它们在仍有信息价值时可保留为普通事件。安全、模型发布、政策等重要事实即使互动低也可进入必读。合格事件不足 5 个时不补满。每项评分和质量决定保存中文理由。
+
+2026-07-17 的本地验收读取 30 条已保存内容，没有重新抓取 X 或文章。阈值调优排除了仅由宽泛词和同日关系召回的低分 Pair，同时保留中英文同事件用例。重复运行使用已有语义和 Pair 缓存，最终 0 次新 DeepSeek 请求。真实正文、事件、报告、Token 统计和缓存均不进入 Git。

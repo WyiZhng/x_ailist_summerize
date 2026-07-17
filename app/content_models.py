@@ -58,6 +58,9 @@ class EventCluster:
     source_urls: list[str]
     final_score: float
     score_reasons_zh: list[str]
+    eligible_for_digest: bool = True
+    eligible_for_must_read: bool = True
+    quality_gate_reasons_zh: list[str] = field(default_factory=list)
     must_read: bool = False
     rank: int | None = None
 

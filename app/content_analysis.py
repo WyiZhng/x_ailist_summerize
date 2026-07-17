@@ -29,6 +29,17 @@ class AnalysisProvider(Protocol):
     def analyze(self, item: Any) -> AnalysisResult: ...
 
 
+@dataclass(frozen=True)
+class PairDecision:
+    relationship: str
+    confidence: float
+    reason_zh: str
+
+    @property
+    def same_event(self) -> bool:
+        return self.relationship == "same_event" and self.confidence >= 0.7
+
+
 class DeepSeekContentAnalysisProvider:
     def __init__(
         self, config: dict, cache_dir: Path, *, max_requests: int, max_tokens: int
@@ -147,6 +158,88 @@ class DeepSeekContentAnalysisProvider:
         )
         return result
 
+    def analyze_pair(self, left: Any, right: Any) -> PairDecision:
+        """Classify only a recalled grey pair; cache it independently."""
+        endpoint, key, model = self.llm._get_effective_config()
+        cache_key = hashlib.sha256(
+            (
+                "|".join(
+                    sorted((left.analysis_text_hash, right.analysis_text_hash))
+                    + ["pair_cluster_zh_v1", model]
+                )
+            ).encode()
+        ).hexdigest()
+        path = self.cache_dir / (cache_key + ".pair.json")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            result = PairDecision(**value["result"])
+            if result.relationship in {
+                "same_event",
+                "follow_up",
+                "related_topic",
+                "contradictory_report",
+                "unrelated",
+                "unclear",
+            } and validate_chinese(result.reason_zh):
+                self.hits += 1
+                return result
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        if (
+            self.requests >= self.max_requests
+            or self.prompt_tokens + self.completion_tokens >= self.max_tokens
+        ):
+            raise RuntimeError("analysis_budget_exhausted")
+        prompt = BASE_PROMPT + (
+            '\n比较两个候选是否描述同一事件。只输出 JSON：{"relationship":"same_event|follow_up|related_topic|contradictory_report|unrelated|unclear","confidence":0到1数字,"reason_zh":"中文理由"}。只有主体、动作、产品/版本和时间兼容时才用 same_event；低置信度用 unclear。\n'
+            f"<UNTRUSTED_SOURCE>A: {left.post_text_original[:900]}\nB: {right.post_text_original[:900]}</UNTRUSTED_SOURCE>"
+        )
+        response = OpenAI(
+            base_url=endpoint, api_key=key, timeout=60
+        ).chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=350,
+        )
+        self.requests += 1
+        usage = response.usage
+        prompt_tokens, completion = (
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+        )
+        if isinstance(prompt_tokens, int):
+            self.prompt_tokens += prompt_tokens
+        if isinstance(completion, int):
+            self.completion_tokens += completion
+        value = parse_structured_json(response.choices[0].message.content or "")
+        relationship = value.get("relationship")
+        confidence = value.get("confidence")
+        reason = value.get("reason_zh")
+        if (
+            relationship
+            not in {
+                "same_event",
+                "follow_up",
+                "related_topic",
+                "contradictory_report",
+                "unrelated",
+                "unclear",
+            }
+            or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1
+            or not isinstance(reason, str)
+            or not validate_chinese(reason)
+        ):
+            raise ValueError("pair_schema_invalid")
+        result = PairDecision(relationship, float(confidence), reason)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"result": result.__dict__}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return result
+
 
 class MockContentAnalysisProvider:
     def __init__(self):
@@ -163,3 +256,7 @@ class MockContentAnalysisProvider:
             True,
             {"prompt_tokens": None, "completion_tokens": None},
         )
+
+    def analyze_pair(self, left: Any, right: Any) -> PairDecision:
+        self.calls += 1
+        return PairDecision("unrelated", 0.9, "离线模拟默认不合并灰区候选。")

@@ -69,13 +69,15 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             "error": None,
             "last_report": None,
         }
-        handler = lambda *args, **kwargs: web_ui.DashHandler(
-            *args, app_state=self.app_state, **kwargs
-        )
+
+        def handler(*args, **kwargs):
+            return web_ui.DashHandler(*args, app_state=self.app_state, **kwargs)
+
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def tearDown(self):
         self.server.shutdown()
@@ -92,7 +94,7 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             headers={"Content-Type": "application/json", **(headers or {})},
             method="POST" if data is not None else "GET",
         )
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with self.http.open(request, timeout=5) as response:
             return response.status, dict(response.headers), response.read()
 
     def test_public_config_returns_only_secret_state_and_masks(self):
@@ -112,6 +114,14 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(payload["twitter"]["api_bearer_token_configured"])
         self.assertTrue(payload["twitter"]["cookies_configured"])
+
+    def test_local_test_client_ignores_system_proxy(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HTTP_PROXY": "http://127.0.0.1:1", "HTTPS_PROXY": "http://127.0.0.1:1"},
+        ):
+            status, _, _ = self.request("/api/config")
+        self.assertEqual(status, 200)
 
     def test_status_does_not_block_on_external_health_checks(self):
         finished = threading.Event()
@@ -209,7 +219,9 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 200)
         self.assertIn("Content-Security-Policy", headers)
-        self.assertIn('sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"', page)
+        self.assertIn(
+            'sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"', page
+        )
         self.assertIn("${escapeHtml(h.name)}", page)
         self.assertIn("${escapeHtml(h.username)}", page)
         self.assertNotIn(" onerror=", page.lower())
@@ -219,10 +231,10 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         report_name = "summary_security.html"
         (web_ui.OUTPUT_DIR / report_name).write_text(
-            '<script>window.__legacy_xss = true</script>', encoding="utf-8"
+            "<script>window.__legacy_xss = true</script>", encoding="utf-8"
         )
         request = urllib.request.Request(self.base_url + "/output/" + report_name)
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with self.http.open(request, timeout=5) as response:
             report_csp = response.headers.get("Content-Security-Policy", "")
         self.assertIn(
             "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox",
@@ -267,7 +279,7 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             headers={"Host": "attacker.example"},
         )
         with self.assertRaises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(request, timeout=5)
+            self.http.open(request, timeout=5)
         self.assertEqual(caught.exception.code, 403)
 
         cross_site = urllib.request.Request(
@@ -275,7 +287,7 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             headers={"Sec-Fetch-Site": "cross-site"},
         )
         with self.assertRaises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(cross_site, timeout=5)
+            self.http.open(cross_site, timeout=5)
         self.assertEqual(caught.exception.code, 403)
 
         wrong_local_origin = urllib.request.Request(
@@ -283,15 +295,17 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             headers={"Origin": "http://localhost:9999"},
         )
         with self.assertRaises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(wrong_local_origin, timeout=5)
+            self.http.open(wrong_local_origin, timeout=5)
         self.assertEqual(caught.exception.code, 403)
 
     def test_state_changing_reset_requires_post(self):
         with self.assertRaises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(self.base_url + "/api/reset-progress", timeout=5)
+            self.http.open(self.base_url + "/api/reset-progress", timeout=5)
         self.assertEqual(caught.exception.code, 404)
 
-        self.app_state.update({"progress": 80, "status_msg": "Working", "last_report": "x.html"})
+        self.app_state.update(
+            {"progress": 80, "status_msg": "Working", "last_report": "x.html"}
+        )
         status, _, raw = self.request("/api/reset-progress", data={})
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(raw)["success"])
@@ -399,17 +413,21 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             method="POST",
         )
         with self.assertRaises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(request, timeout=5)
+            self.http.open(request, timeout=5)
         self.assertEqual(caught.exception.code, 415)
 
-    def test_history_tolerates_non_object_metadata_and_report_symlinks_are_rejected(self):
+    def test_history_tolerates_non_object_metadata_and_report_symlinks_are_rejected(
+        self,
+    ):
         report = web_ui.OUTPUT_DIR / "summary_valid.html"
         report.write_text("safe", encoding="utf-8")
         (web_ui.OUTPUT_DIR / "history.json").write_text("[]", encoding="utf-8")
 
         status, _, raw = self.request("/api/history")
         self.assertEqual(status, 200)
-        self.assertTrue(any(item["filename"] == report.name for item in json.loads(raw)))
+        self.assertTrue(
+            any(item["filename"] == report.name for item in json.loads(raw))
+        )
 
         outside = self.directory / "outside.html"
         outside.write_text("outside-secret", encoding="utf-8")
@@ -420,7 +438,7 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             return
 
         with self.assertRaises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(self.base_url + "/output/" + link.name, timeout=5)
+            self.http.open(self.base_url + "/output/" + link.name, timeout=5)
         self.assertEqual(caught.exception.code, 404)
 
     async def test_web_task_orchestration_uses_injected_offline_providers(self):
@@ -448,7 +466,9 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             mock.patch.object(web_ui, "_build_fetcher", return_value=fetcher),
-            mock.patch.object(web_ui, "LLMProvider", return_value=MockSummaryProvider()),
+            mock.patch.object(
+                web_ui, "LLMProvider", return_value=MockSummaryProvider()
+            ),
         ):
             await handler._run_async_task()
 
@@ -460,8 +480,12 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report_name)
         report = web_ui.OUTPUT_DIR / report_name
         self.assertTrue(report.exists())
-        self.assertNotIn("<script>window.__mock_xss", report.read_text(encoding="utf-8"))
-        history = json.loads((web_ui.OUTPUT_DIR / "history.json").read_text(encoding="utf-8"))
+        self.assertNotIn(
+            "<script>window.__mock_xss", report.read_text(encoding="utf-8")
+        )
+        history = json.loads(
+            (web_ui.OUTPUT_DIR / "history.json").read_text(encoding="utf-8")
+        )
         self.assertIn(report_name, history)
 
     async def test_twikit_incremental_no_new_posts_preserves_previous_report(self):
@@ -494,7 +518,9 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         }
         first_summary = MockSummaryProvider()
         with (
-            mock.patch.object(web_ui, "_build_fetcher", return_value=WebIngestionFetcher()),
+            mock.patch.object(
+                web_ui, "_build_fetcher", return_value=WebIngestionFetcher()
+            ),
             mock.patch.object(web_ui, "LLMProvider", return_value=first_summary),
         ):
             await handler._run_async_task()
@@ -505,7 +531,9 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
         handler.app_state["running"] = True
         second_summary = MockSummaryProvider()
         with (
-            mock.patch.object(web_ui, "_build_fetcher", return_value=WebIngestionFetcher()),
+            mock.patch.object(
+                web_ui, "_build_fetcher", return_value=WebIngestionFetcher()
+            ),
             mock.patch.object(web_ui, "LLMProvider", return_value=second_summary),
         ):
             await handler._run_async_task()
@@ -555,7 +583,9 @@ class WebConfigurationSecurityTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(
                 web_ui, "_build_fetcher", return_value=WebFetcher(fail_report=True)
             ),
-            mock.patch.object(web_ui, "LLMProvider", return_value=MockSummaryProvider()),
+            mock.patch.object(
+                web_ui, "LLMProvider", return_value=MockSummaryProvider()
+            ),
         ):
             await handler._run_async_task()
         self.assertIsNotNone(handler.app_state["error"])
